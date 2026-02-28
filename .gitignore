@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.venv/
+.env
+
+# PyGame
+*.log
+nohup.out
+
+# AI Models
+*.pth
+*.pth.tar
+
+# Logs
+train.log
+checkpoint/
+tensorboard/
+runs/
+
+# IDE
+.vscode/
+.idea/
+.DS_Store
