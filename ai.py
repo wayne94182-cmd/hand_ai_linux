@@ -11,7 +11,7 @@ import torch.nn.functional as F
 # ==========================================
 
 HIDDEN_SIZE = 256
-NUM_ACTIONS = 8
+NUM_ACTIONS = 9
 
 
 class ConvSNN(nn.Module):
