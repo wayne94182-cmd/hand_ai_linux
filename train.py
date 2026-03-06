@@ -1,3 +1,8 @@
+"""
+train.py — MAPPO + N-Agent Flatten 訓練腳本
+支援多個 learning agents、LSTM 隱藏狀態管理、
+通訊向量、action masking、以及分離的 Actor / Critic 優化。
+"""
 import argparse
 import logging
 import multiprocessing as mp
@@ -11,11 +16,12 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import torch.optim as optim
-from torch.distributions import Bernoulli
+from torch.distributions import Bernoulli, Normal
 from tqdm import tqdm
 
-from ai import ConvSNN, HIDDEN_SIZE
+from ai import ConvLSTM, TeamPoolingCritic, CommHandler, HIDDEN_SIZE, NUM_COMM
 from game import GameEnv, get_stage_spec
+from game.env import NUM_CHANNELS, NUM_SCALARS
 
 logging.basicConfig(
     level=logging.INFO,
@@ -27,6 +33,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# ── 超參數 ──────────────────────────────────────────────
 FRAME_SKIP = 2
 NUM_ENVS = 128
 GAMMA = 0.990
@@ -43,7 +50,10 @@ ROLLING_WIN_WINDOW = 200
 SAVE_EVERY = 2500
 STOP_SIGNAL_FILE = "STOP_AND_SAVE"
 
-# MANUAL_STOP = False
+# 新增超參數
+COMM_ENT_COEF = 0.01
+INDIVIDUAL_REWARD_WEIGHT = 0.6
+TEAM_REWARD_WEIGHT = 0.4
 
 MANUAL_STOP = False
 
@@ -80,23 +90,42 @@ def format_time(seconds):
     return f"{h:02d}:{m:02d}:{s:02d}"
 
 
-def _worker(remote, parent_remote, env_fn, stage_id):
+# ═══════════════════════════════════════════════════════
+#  VecEnv Worker（支援多 AI）
+# ═══════════════════════════════════════════════════════
+
+def _worker(remote, parent_remote, env_fn, stage_id, n_ai):
     parent_remote.close()
-    env = env_fn(stage_id)
+    env = env_fn(stage_id, n_ai)
 
     try:
         while True:
             cmd, data = remote.recv()
             if cmd == "step":
-                act, enemy_act, frame_skip = data
-                state, reward, done, info = env.step(act, enemy_ai_action=enemy_act, frame_skip=frame_skip)
-                if done:
-                    new_state = env.reset()
-                    remote.send((state, reward, True, new_state, info))
+                actions_list, frame_skip = data
+                result = env.step(actions_list, frame_skip=frame_skip)
+                if n_ai == 1:
+                    state, reward, done, info = result
+                    states_list = [state]
+                    rewards_list = [reward]
                 else:
-                    remote.send((state, reward, False, None, info))
+                    states_list, rewards_list, done, info = result
+
+                if done:
+                    new_result = env.reset()
+                    if n_ai == 1:
+                        new_states_list = [new_result]
+                    else:
+                        new_states_list = new_result
+                    remote.send((states_list, rewards_list, True, new_states_list, info))
+                else:
+                    remote.send((states_list, rewards_list, False, None, info))
             elif cmd == "reset":
-                remote.send(env.reset())
+                result = env.reset()
+                if n_ai == 1:
+                    remote.send([result])
+                else:
+                    remote.send(result)
             elif cmd == "set_stage":
                 env.set_stage(data)
                 remote.send(True)
@@ -110,20 +139,20 @@ def _worker(remote, parent_remote, env_fn, stage_id):
     finally:
         if getattr(env, "render_mode", False):
             import pygame
-
             pygame.quit()
 
 
 class VecEnv:
-    def __init__(self, env_fn, num_envs, stage_id):
+    def __init__(self, env_fn, num_envs, stage_id, n_ai):
         self.num_envs = num_envs
+        self.n_ai = n_ai
         self.waiting = False
         self.closed = False
         self.remotes, self.work_remotes = zip(*[mp.Pipe() for _ in range(num_envs)])
         self.procs = []
 
         for wr, r in zip(self.work_remotes, self.remotes):
-            p = mp.Process(target=_worker, args=(wr, r, env_fn, stage_id), daemon=True)
+            p = mp.Process(target=_worker, args=(wr, r, env_fn, stage_id, n_ai), daemon=True)
             p.start()
             self.procs.append(p)
             wr.close()
@@ -139,16 +168,18 @@ class VecEnv:
         for r in self.remotes:
             _ = r.recv()
 
-    def step_async(self, actions, enemy_actions, frame_skip):
+    def step_async(self, actions_per_env, frame_skip):
+        """actions_per_env[j] = list of N_AI actions for env j"""
         for i, r in enumerate(self.remotes):
-            r.send(("step", (actions[i], enemy_actions[i], frame_skip)))
+            r.send(("step", (actions_per_env[i], frame_skip)))
         self.waiting = True
 
     def step_wait(self):
         results = [r.recv() for r in self.remotes]
         self.waiting = False
-        states, rewards, dones, new_states, infos = zip(*results)
-        return list(states), list(rewards), list(dones), list(new_states), list(infos)
+        states_list, rewards_list, dones, new_states_list, infos = zip(*results)
+        return (list(states_list), list(rewards_list),
+                list(dones), list(new_states_list), list(infos))
 
     def close(self):
         if self.closed:
@@ -163,38 +194,60 @@ class VecEnv:
         self.closed = True
 
 
-def save_checkpoint(path, model, optimizer, total_eps_done, stage_id):
+# ═══════════════════════════════════════════════════════
+#  Checkpoint
+# ═══════════════════════════════════════════════════════
+
+def save_checkpoint(path, model, critic, optimizer, optimizer_critic,
+                    total_eps_done, stage_id, n_ai):
     payload = {
         "model_state": model.state_dict(),
+        "critic_state": critic.state_dict(),
         "optimizer_state": optimizer.state_dict(),
+        "optimizer_critic_state": optimizer_critic.state_dict(),
         "total_eps_done": total_eps_done,
         "stage_id": stage_id,
+        "n_ai": n_ai,
     }
     torch.save(payload, path)
 
 
-def load_checkpoint(path, model, optimizer, device):
+def load_checkpoint(path, model, critic, optimizer, optimizer_critic, device):
     ckpt = torch.load(path, map_location=device)
 
     if isinstance(ckpt, dict) and "model_state" in ckpt:
         model.load_state_dict(ckpt["model_state"])
         if optimizer is not None and "optimizer_state" in ckpt:
             optimizer.load_state_dict(ckpt["optimizer_state"])
-        return int(ckpt.get("total_eps_done", 0)), int(ckpt.get("stage_id", 0))
+        if critic is not None and "critic_state" in ckpt:
+            critic.load_state_dict(ckpt["critic_state"])
+        if optimizer_critic is not None and "optimizer_critic_state" in ckpt:
+            optimizer_critic.load_state_dict(ckpt["optimizer_critic_state"])
+        return (int(ckpt.get("total_eps_done", 0)),
+                int(ckpt.get("stage_id", 0)),
+                int(ckpt.get("n_ai", 1)))
 
     # backward compatibility: pure state_dict
     model.load_state_dict(ckpt)
-    return 0, 0
+    return 0, 0, 1
 
 
-def train(resume_path=None, forced_stage=None, target_stage_eps=50000):
+# ═══════════════════════════════════════════════════════
+#  主訓練迴圈
+# ═══════════════════════════════════════════════════════
+
+def train(resume_path=None, forced_stage=None, target_stage_eps=50000, n_ai=2):
     global MANUAL_STOP
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    logger.info(f"訓練裝置: {device}")
+    logger.info(f"訓練裝置: {device}, N_AI={n_ai}")
 
-    model = ConvSNN().to(device)
+    FLAT_BATCH = n_ai * NUM_ENVS
+
+    model = ConvLSTM().to(device)
+    critic = TeamPoolingCritic().to(device)
     optimizer = optim.Adam(model.parameters(), lr=LR)
+    optimizer_critic = optim.Adam(critic.parameters(), lr=LR)
     use_amp = device.type == "cuda"
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
@@ -204,19 +257,29 @@ def train(resume_path=None, forced_stage=None, target_stage_eps=50000):
 
     if resume_path and os.path.exists(resume_path):
         logger.info(f"載入 checkpoint: {resume_path}")
-        ckpt_eps_done, resume_stage = load_checkpoint(resume_path, model, optimizer, device)
+        ckpt_eps, resume_stage, ckpt_n_ai = load_checkpoint(
+            resume_path, model, critic, optimizer, optimizer_critic, device)
         if forced_stage is not None and forced_stage != resume_stage:
             logger.info("進入新階段，保留模型權重，局數歸零")
             total_eps_done = 0
         else:
-            total_eps_done = ckpt_eps_done
+            total_eps_done = ckpt_eps
         save_milestone = ((total_eps_done // SAVE_EVERY) + 1) * SAVE_EVERY
-        logger.info(f"續訓起點: episodes={total_eps_done}, stage={resume_stage}, next_save={save_milestone}")
+        logger.info(f"續訓起點: episodes={total_eps_done}, stage={resume_stage}, "
+                    f"ckpt_n_ai={ckpt_n_ai}, next_save={save_milestone}")
 
     current_stage = forced_stage if forced_stage is not None else resume_stage
 
-    logger.info(f"啟動 {NUM_ENVS} 個環境, 初始階段 Stage {current_stage} - {get_stage_spec(current_stage).name}")
-    vec_env = VecEnv(env_fn=lambda sid: GameEnv(render_mode=False, stage_id=sid), num_envs=NUM_ENVS, stage_id=current_stage)
+    logger.info(f"啟動 {NUM_ENVS} 個環境 × {n_ai} AI, "
+                f"初始階段 Stage {current_stage} - {get_stage_spec(current_stage).name}")
+
+    vec_env = VecEnv(
+        env_fn=lambda sid, nai: GameEnv(render_mode=False, stage_id=sid,
+                                        n_learning_agents=nai),
+        num_envs=NUM_ENVS,
+        stage_id=current_stage,
+        n_ai=n_ai,
+    )
 
     batch_episodes = max(1, target_stage_eps // NUM_ENVS)
     start_batch = total_eps_done // NUM_ENVS
@@ -224,12 +287,14 @@ def train(resume_path=None, forced_stage=None, target_stage_eps=50000):
 
     rolling_win = deque(maxlen=ROLLING_WIN_WINDOW)
 
-    pbar = tqdm(range(start_batch, batch_episodes), desc="PPO", unit="batch", dynamic_ncols=True)
+    pbar = tqdm(range(start_batch, batch_episodes), desc="PPO", unit="batch",
+                dynamic_ncols=True)
 
     for batch_ep in pbar:
         if MANUAL_STOP or os.path.exists(STOP_SIGNAL_FILE):
             stop_path = f"snn_S{current_stage}_ep_{total_eps_done}_manual_stop.pth"
-            save_checkpoint(stop_path, model, optimizer, total_eps_done, current_stage)
+            save_checkpoint(stop_path, model, critic, optimizer, optimizer_critic,
+                            total_eps_done, current_stage, n_ai)
             logger.info(f"收到中斷指令，已存檔並停止: {stop_path}")
             if os.path.exists(STOP_SIGNAL_FILE):
                 os.remove(STOP_SIGNAL_FILE)
@@ -237,7 +302,6 @@ def train(resume_path=None, forced_stage=None, target_stage_eps=50000):
 
         batch_start_time = time.time()
 
-        # remove automatic change current_stage
         vec_env.set_stage(current_stage)
         stage_spec = get_stage_spec(current_stage)
 
@@ -245,120 +309,202 @@ def train(resume_path=None, forced_stage=None, target_stage_eps=50000):
         entropy_coef = ENT_START + (ENT_END - ENT_START) * progress
 
         model.eval()
-        h_ai = torch.zeros(1, NUM_ENVS, HIDDEN_SIZE, device=device)
-        h_enemy = torch.zeros(1, NUM_ENVS, HIDDEN_SIZE, device=device)
 
-        states_list = vec_env.reset()
+        # 隱藏狀態：展平 (n_ai × NUM_ENVS)
+        h = torch.zeros(1, FLAT_BATCH, HIDDEN_SIZE, device=device)
+        c = torch.zeros(1, FLAT_BATCH, HIDDEN_SIZE, device=device)
+        last_comm = np.zeros((FLAT_BATCH, NUM_COMM), dtype=np.float32)
 
-        traj = [{"states": [], "actions": [], "rewards": [], "values": [], "old_lp": []} for _ in range(NUM_ENVS)]
+        # 重置所有環境
+        env_states = vec_env.reset()
+        # env_states[j] = list of n_ai (view, scalar) tuples
+
+        # 軌跡收集（per flat index）
+        traj = [{"states": [], "actions": [], "rewards": [], "values": [],
+                 "old_lp": [], "comm_acts": [], "comm_lp": [],
+                 "comm_mu": [], "comm_logstd": [], "masks": []}
+                for _ in range(FLAT_BATCH)]
         episode_done = [False] * NUM_ENVS
         env_kills = [0] * NUM_ENVS
         env_wins = [0] * NUM_ENVS
 
         while not all(episode_done):
-            s_np = np.stack([s[0] for s in states_list])
-            sc_np = np.stack([s[1] for s in states_list])
-            s_batch = torch.as_tensor(s_np, dtype=torch.float32, device=device)
-            sc_batch = torch.as_tensor(sc_np, dtype=torch.float32, device=device)
+            # 1. 從 NUM_ENVS 個環境收集狀態
+            s_np = np.zeros((NUM_ENVS, n_ai, NUM_CHANNELS, 15, 15), dtype=np.float32)
+            sc_np = np.zeros((NUM_ENVS, n_ai, NUM_SCALARS), dtype=np.float32)
+            for j in range(NUM_ENVS):
+                for i in range(n_ai):
+                    s_np[j, i] = env_states[j][i][0]
+                    sc_np[j, i] = env_states[j][i][1]
 
+            # 2. 展平：先 AI index，再 env index
+            s_flat = s_np.transpose(1, 0, 2, 3, 4).reshape(FLAT_BATCH, NUM_CHANNELS, 15, 15)
+            sc_flat = sc_np.transpose(1, 0, 2).reshape(FLAT_BATCH, NUM_SCALARS)
+
+            s_t = torch.as_tensor(s_flat, dtype=torch.float32, device=device)
+            sc_t = torch.as_tensor(sc_flat, dtype=torch.float32, device=device)
+
+            # 3. 準備 comm_in (FLAT_BATCH, K, NUM_COMM)
+            # K = n_ai - 1（同 env、同 team、不同 agent）
+            K = max(0, n_ai - 1)
+            comm_in_np = np.zeros((FLAT_BATCH, K, NUM_COMM), dtype=np.float32)
+            for i in range(n_ai):
+                for j in range(NUM_ENVS):
+                    flat_idx = i * NUM_ENVS + j
+                    k_idx = 0
+                    for i2 in range(n_ai):
+                        if i2 == i:
+                            continue
+                        flat_other = i2 * NUM_ENVS + j
+                        if k_idx < K:
+                            comm_in_np[flat_idx, k_idx] = last_comm[flat_other]
+                            k_idx += 1
+
+            comm_in_t = torch.as_tensor(comm_in_np, dtype=torch.float32, device=device)
+
+            # 4. 前向傳播
             with torch.no_grad():
                 with torch.amp.autocast("cuda", enabled=use_amp):
-                    logits, values, h_ai_new = model(s_batch, sc_batch, h_ai)
+                    logits, mu, logstd, feat, (h_new, c_new) = model(
+                        s_t, sc_t, (h, c), comm_in_t)
 
                 logits = logits.float()
-                values = values.float().squeeze(-1)
-                dist = Bernoulli(torch.sigmoid(logits))
-                acts = dist.sample()
-                lp = dist.log_prob(acts).sum(dim=1)
+                feat = feat.float()
 
-                # stage5 自我博弈：敵人也用同一模型
-                if current_stage == 5:
-                    logits_e, _, h_enemy_new = model(s_batch, sc_batch, h_enemy)
-                    dist_e = Bernoulli(torch.sigmoid(logits_e.float()))
-                    enemy_acts = dist_e.sample()
-                    h_enemy = h_enemy_new.clone()
-                else:
-                    enemy_acts = torch.zeros_like(acts)
+                # Critic value
+                # 簡化：stage 0-4 全部 team 0，直接用 feat
+                v = critic(feat)  # (FLAT_BATCH,)
 
-            h_ai = h_ai_new.clone()
+                # 5. 取樣動作
+                dist_disc = Bernoulli(torch.sigmoid(logits))
+                acts = dist_disc.sample()
+                lp_disc = dist_disc.log_prob(acts).sum(dim=1)
+
+                comm_vec, lp_comm = CommHandler.sample(mu, logstd)
+                comm_np_new = CommHandler.to_env(comm_vec)
+
+            h = h_new.clone()
+            c = c_new.clone()
 
             acts_np = acts.cpu().numpy()
-            enemy_acts_np = enemy_acts.cpu().numpy()
-            vals_np = values.cpu().numpy()
-            lp_np = lp.cpu().numpy()
+            vals_np = v.cpu().numpy()
+            lp_disc_np = lp_disc.cpu().numpy()
+            lp_comm_np = lp_comm.cpu().numpy()
+            mu_np = mu.cpu().numpy()
+            logstd_np = logstd.cpu().numpy()
 
-            for i in range(NUM_ENVS):
-                if episode_done[i]:
+            # 存軌跡
+            for i in range(n_ai):
+                for j in range(NUM_ENVS):
+                    if episode_done[j]:
+                        continue
+                    flat = i * NUM_ENVS + j
+                    traj[flat]["states"].append((
+                        torch.from_numpy(s_flat[flat]),
+                        torch.from_numpy(sc_flat[flat]),
+                    ))
+                    traj[flat]["actions"].append(torch.from_numpy(acts_np[flat]))
+                    traj[flat]["values"].append(float(vals_np[flat]))
+                    traj[flat]["old_lp"].append(float(lp_disc_np[flat]))
+                    traj[flat]["comm_acts"].append(
+                        torch.from_numpy(comm_np_new[flat].copy()))
+                    traj[flat]["comm_lp"].append(float(lp_comm_np[flat]))
+                    traj[flat]["comm_mu"].append(
+                        torch.from_numpy(mu_np[flat].copy()))
+                    traj[flat]["comm_logstd"].append(
+                        torch.from_numpy(logstd_np[flat].copy()))
+                    traj[flat]["masks"].append(
+                        torch.ones(12, dtype=torch.bool))  # placeholder
+
+            # 6. 還原形狀派發給 env
+            acts_env = acts_np.reshape(n_ai, NUM_ENVS, 12).transpose(1, 0, 2)
+            last_comm = comm_np_new.copy()
+
+            env_actions = []
+            for j in range(NUM_ENVS):
+                env_actions.append([acts_env[j][i].tolist() for i in range(n_ai)])
+
+            vec_env.step_async(env_actions, FRAME_SKIP)
+            all_states, all_rewards, dones, new_all_states, infos = vec_env.step_wait()
+
+            next_env_states = list(env_states)
+            for j in range(NUM_ENVS):
+                if episode_done[j]:
                     continue
-                traj[i]["states"].append((torch.from_numpy(s_np[i]), torch.from_numpy(sc_np[i])))
-                traj[i]["actions"].append(torch.from_numpy(acts_np[i]))
-                traj[i]["values"].append(float(vals_np[i]))
-                traj[i]["old_lp"].append(float(lp_np[i]))
+                # 存 reward（per flat）
+                for i in range(n_ai):
+                    flat = i * NUM_ENVS + j
+                    rew = all_rewards[j][i] if isinstance(all_rewards[j], list) else all_rewards[j]
+                    traj[flat]["rewards"].append(float(rew))
 
-            vec_env.step_async(acts_np, enemy_acts_np, FRAME_SKIP)
-            prev_states, rewards, dones, new_states, infos = vec_env.step_wait()
-
-            next_states = list(states_list)
-            for i in range(NUM_ENVS):
-                if episode_done[i]:
-                    continue
-                traj[i]["rewards"].append(float(rewards[i]))
-                if dones[i]:
-                    episode_done[i] = True
-                    next_states[i] = new_states[i]
-                    h_ai[:, i, :] = 0.0
-                    h_enemy[:, i, :] = 0.0
-                    env_kills[i] = infos[i].get("kill_count", 0)
-                    env_wins[i] = 1 if infos[i].get("ai_win", False) else 0
+                if dones[j]:
+                    episode_done[j] = True
+                    next_env_states[j] = new_all_states[j]
+                    for i in range(n_ai):
+                        flat = i * NUM_ENVS + j
+                        h[:, flat, :] = 0.0
+                        c[:, flat, :] = 0.0
+                        last_comm[flat] = 0.0
+                    env_kills[j] = infos[j].get("kill_count", 0)
+                    env_wins[j] = 1 if infos[j].get("ai_win", False) else 0
                 else:
-                    next_states[i] = prev_states[i]
-            states_list = next_states
+                    next_env_states[j] = all_states[j]
+            env_states = next_env_states
 
+        # ── GAE ──
         all_advs = []
-        avg_rewards = []
-        for i in range(NUM_ENVS):
-            rews = traj[i]["rewards"]
-            vals = traj[i]["values"]
-            avg_rewards.append(sum(rews) if rews else 0.0)
+        for flat in range(FLAT_BATCH):
+            rews = traj[flat]["rewards"]
+            vals = traj[flat]["values"]
             if not rews:
-                traj[i]["advantages"] = []
-                traj[i]["returns"] = []
+                traj[flat]["advantages"] = []
+                traj[flat]["returns"] = []
                 continue
             advs = compute_gae(rews, vals)
             rets = [a + v for a, v in zip(advs, vals)]
-            traj[i]["advantages"] = advs
-            traj[i]["returns"] = rets
+            traj[flat]["advantages"] = advs
+            traj[flat]["returns"] = rets
             all_advs.extend(advs)
 
         if len(all_advs) > 1:
             a_mean = float(np.mean(all_advs))
             a_std = float(np.std(all_advs)) + 1e-8
-            for i in range(NUM_ENVS):
-                traj[i]["advantages"] = [(a - a_mean) / a_std for a in traj[i]["advantages"]]
+            for flat in range(FLAT_BATCH):
+                traj[flat]["advantages"] = [
+                    (a - a_mean) / a_std for a in traj[flat]["advantages"]]
 
-        t_per_env = [len(traj[i]["states"]) for i in range(NUM_ENVS)]
-        max_t = max(t_per_env) if max(t_per_env) > 0 else 1
-        s_shape = (4, 15, 15)
+        # ── 打包 batch tensor ──
+        t_per_flat = [len(traj[f]["states"]) for f in range(FLAT_BATCH)]
+        max_t = max(t_per_flat) if t_per_flat and max(t_per_flat) > 0 else 1
 
-        bat_states = torch.zeros(max_t, NUM_ENVS, *s_shape)
-        bat_scalars = torch.zeros(max_t, NUM_ENVS, 9)
-        bat_actions = torch.zeros(max_t, NUM_ENVS, 9)
-        bat_old_lp = torch.zeros(max_t, NUM_ENVS)
-        bat_adv = torch.zeros(max_t, NUM_ENVS)
-        bat_ret = torch.zeros(max_t, NUM_ENVS)
-        mask = torch.zeros(max_t, NUM_ENVS, dtype=torch.bool)
+        bat_states = torch.zeros(max_t, FLAT_BATCH, NUM_CHANNELS, 15, 15)
+        bat_scalars = torch.zeros(max_t, FLAT_BATCH, NUM_SCALARS)
+        bat_actions = torch.zeros(max_t, FLAT_BATCH, 12)
+        bat_old_lp = torch.zeros(max_t, FLAT_BATCH)
+        bat_adv = torch.zeros(max_t, FLAT_BATCH)
+        bat_ret = torch.zeros(max_t, FLAT_BATCH)
+        bat_comm_acts = torch.zeros(max_t, FLAT_BATCH, NUM_COMM)
+        bat_comm_lp = torch.zeros(max_t, FLAT_BATCH)
+        bat_comm_mu = torch.zeros(max_t, FLAT_BATCH, NUM_COMM)
+        bat_comm_logstd = torch.zeros(max_t, FLAT_BATCH, NUM_COMM)
+        mask = torch.zeros(max_t, FLAT_BATCH, dtype=torch.bool)
 
-        for i in range(NUM_ENVS):
-            t_i = t_per_env[i]
+        for f in range(FLAT_BATCH):
+            t_i = t_per_flat[f]
             if t_i == 0:
                 continue
-            mask[:t_i, i] = True
-            bat_states[:t_i, i] = torch.stack([x[0] for x in traj[i]["states"]])
-            bat_scalars[:t_i, i] = torch.stack([x[1] for x in traj[i]["states"]])
-            bat_actions[:t_i, i] = torch.stack(traj[i]["actions"])
-            bat_old_lp[:t_i, i] = torch.tensor(traj[i]["old_lp"])
-            bat_adv[:t_i, i] = torch.tensor(traj[i]["advantages"])
-            bat_ret[:t_i, i] = torch.tensor(traj[i]["returns"])
+            mask[:t_i, f] = True
+            bat_states[:t_i, f] = torch.stack([x[0] for x in traj[f]["states"]])
+            bat_scalars[:t_i, f] = torch.stack([x[1] for x in traj[f]["states"]])
+            bat_actions[:t_i, f] = torch.stack(traj[f]["actions"])
+            bat_old_lp[:t_i, f] = torch.tensor(traj[f]["old_lp"])
+            bat_adv[:t_i, f] = torch.tensor(traj[f]["advantages"])
+            bat_ret[:t_i, f] = torch.tensor(traj[f]["returns"])
+            if traj[f]["comm_acts"]:
+                bat_comm_acts[:t_i, f] = torch.stack(traj[f]["comm_acts"])
+                bat_comm_lp[:t_i, f] = torch.tensor(traj[f]["comm_lp"])
+                bat_comm_mu[:t_i, f] = torch.stack(traj[f]["comm_mu"])
+                bat_comm_logstd[:t_i, f] = torch.stack(traj[f]["comm_logstd"])
 
         bat_states = bat_states.to(device)
         bat_scalars = bat_scalars.to(device)
@@ -366,13 +512,22 @@ def train(resume_path=None, forced_stage=None, target_stage_eps=50000):
         bat_old_lp = bat_old_lp.to(device)
         bat_adv = bat_adv.to(device)
         bat_ret = bat_ret.to(device)
+        bat_comm_acts = bat_comm_acts.to(device)
+        bat_comm_lp = bat_comm_lp.to(device)
+        bat_comm_mu = bat_comm_mu.to(device)
+        bat_comm_logstd = bat_comm_logstd.to(device)
         mask = mask.to(device)
 
+        # ── PPO 更新 ──
         model.train()
+        critic.train()
         for _ in range(PPO_EPOCHS):
             optimizer.zero_grad()
-            h = torch.zeros(1, NUM_ENVS, HIDDEN_SIZE, device=device)
-            ep_losses = []
+            optimizer_critic.zero_grad()
+            h_tr = torch.zeros(1, FLAT_BATCH, HIDDEN_SIZE, device=device)
+            c_tr = torch.zeros(1, FLAT_BATCH, HIDDEN_SIZE, device=device)
+            ep_actor_losses = []
+            ep_critic_losses = []
 
             for t in range(max_t):
                 s = bat_states[t]
@@ -382,68 +537,104 @@ def train(resume_path=None, forced_stage=None, target_stage_eps=50000):
                 adv = bat_adv[t]
                 ret = bat_ret[t]
                 m_t = mask[t]
+                old_ca = bat_comm_acts[t]
+                old_clp = bat_comm_lp[t]
 
                 if not m_t.any():
                     with torch.no_grad():
-                        _, _, h = model(s, sc, h)
-                    h = h.detach()
+                        _, _, _, _, (h_tr, c_tr) = model(s, sc, (h_tr, c_tr))
+                    h_tr = h_tr.detach()
+                    c_tr = c_tr.detach()
                     continue
 
                 with torch.amp.autocast("cuda", enabled=use_amp):
-                    logits, val, h = model(s, sc, h)
+                    logits, new_mu, new_logstd, feat, (h_tr, c_tr) = model(
+                        s, sc, (h_tr, c_tr))
 
                 logits = logits.float()
-                val = val.float().squeeze(-1)
+                feat = feat.float()
+
+                # 離散動作
                 probs = torch.sigmoid(logits)
-                dist = Bernoulli(probs)
-                new_lp = dist.log_prob(a).sum(dim=1)
-                entropy = dist.entropy().sum(dim=1)
+                dist_d = Bernoulli(probs)
+                new_lp = dist_d.log_prob(a).sum(dim=1)
+                entropy_d = dist_d.entropy().sum(dim=1)
 
                 ratio = torch.exp(new_lp - lp_old)
                 surr1 = ratio * adv
                 surr2 = torch.clamp(ratio, 1 - CLIP_EPS, 1 + CLIP_EPS) * adv
-                actor_l = -torch.min(surr1, surr2)
-                critic_l = (val - ret).pow(2)
+                actor_loss = -torch.min(surr1, surr2)
+
+                # 通訊損失
+                new_std = torch.exp(new_logstd)
+                new_comm_lp = CommHandler.old_log_prob(new_mu, new_logstd, old_ca)
+                ratio_c = torch.exp(new_comm_lp - old_clp)
+                surr1_c = ratio_c * adv
+                surr2_c = torch.clamp(ratio_c, 1 - CLIP_EPS, 1 + CLIP_EPS) * adv
+                comm_loss = -torch.min(surr1_c, surr2_c)
+                comm_entropy = Normal(new_mu, new_std + 1e-8).entropy().sum(dim=1)
+
+                total_actor = (actor_loss + comm_loss
+                               - entropy_coef * entropy_d
+                               - COMM_ENT_COEF * comm_entropy)
 
                 valid = m_t.float()
                 n_valid = valid.sum().clamp(min=1)
-                step_loss = actor_l + VALUE_COEF * critic_l - entropy_coef * entropy
-                t_loss = (step_loss * valid).sum() / n_valid
-                ep_losses.append(t_loss)
+                t_actor = (total_actor * valid).sum() / n_valid
+                ep_actor_losses.append(t_actor)
 
-            if ep_losses:
-                total_loss = torch.stack(ep_losses).mean()
-                scaler.scale(total_loss).backward()
+                # Critic loss
+                v_pred = critic(feat)
+                critic_l = (v_pred - ret).pow(2)
+                t_critic = (critic_l * valid).sum() / n_valid
+                ep_critic_losses.append(t_critic)
+
+            # Actor backward
+            if ep_actor_losses:
+                total_actor_loss = torch.stack(ep_actor_losses).mean()
+                scaler.scale(total_actor_loss).backward()
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), MAX_GRAD)
                 scaler.step(optimizer)
-                scaler.update()
+
+            # Critic backward
+            if ep_critic_losses:
+                total_critic_loss = torch.stack(ep_critic_losses).mean() * VALUE_COEF
+                total_critic_loss.backward()
+                torch.nn.utils.clip_grad_norm_(critic.parameters(), MAX_GRAD)
+                optimizer_critic.step()
+
+            scaler.update()
 
         total_eps_done += NUM_ENVS
         batch_time = time.time() - batch_start_time
         elapsed = time.time() - start_time
 
-        avg_rew = float(np.mean(avg_rewards))
+        avg_rew_per_env = []
+        for j in range(NUM_ENVS):
+            env_total = 0.0
+            for i in range(n_ai):
+                flat = i * NUM_ENVS + j
+                env_total += sum(traj[flat]["rewards"]) if traj[flat]["rewards"] else 0.0
+            avg_rew_per_env.append(env_total / n_ai)
+        avg_rew = float(np.mean(avg_rew_per_env))
 
         for k, w in zip(env_kills, env_wins):
             rolling_win.append((k, w))
-        
-        # 計算統計資料
+
         roll_list = list(rolling_win)
         total_ep = len(roll_list)
         dist_str = ""
         rolling_win_rate = 0.0
-        
+
         if total_ep > 0:
             rolling_win_rate = sum(x[1] for x in roll_list) / total_ep
-            
-            # 只有追殺 NPC 模式 (scripted 模式) 才顯示擊殺分佈
             if stage_spec.mode == "scripted":
                 max_e = stage_spec.enemy_count
                 kills_only = [x[0] for x in roll_list]
                 dist = [kills_only.count(i) / total_ep for i in range(max_e + 1)]
                 dist_str = " ".join([f"k{i}:{p:.2f}" for i, p in enumerate(dist)])
-        
+
         show_stats = current_stage <= 6
 
         batches_done = batch_ep - start_batch + 1
@@ -475,7 +666,8 @@ def train(resume_path=None, forced_stage=None, target_stage_eps=50000):
 
         if total_eps_done >= save_milestone:
             path = f"snn_S{current_stage}_ep_{save_milestone}.pth"
-            save_checkpoint(path, model, optimizer, total_eps_done, current_stage)
+            save_checkpoint(path, model, critic, optimizer, optimizer_critic,
+                            total_eps_done, current_stage, n_ai)
             logger.info(f"已儲存 checkpoint: {path}")
             save_milestone += SAVE_EVERY
 
@@ -483,7 +675,8 @@ def train(resume_path=None, forced_stage=None, target_stage_eps=50000):
     vec_env.close()
 
     final_path = f"snn_S{current_stage}_ep_final.pth"
-    save_checkpoint(final_path, model, optimizer, total_eps_done, current_stage)
+    save_checkpoint(final_path, model, critic, optimizer, optimizer_critic,
+                    total_eps_done, current_stage, n_ai)
     logger.info(f"訓練結束，已儲存: {final_path}")
     logger.info(f"中斷存檔指令: touch {STOP_SIGNAL_FILE}")
 
@@ -493,8 +686,13 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--resume", type=str, default=None, help="checkpoint path")
-    parser.add_argument("--stage", type=int, default=None, choices=[0, 1, 2, 3, 4, 5, 6], help="固定訓練階段")
+    parser.add_argument("--stage", type=int, default=None,
+                        choices=[0, 1, 2, 3, 4, 5, 6], help="固定訓練階段")
     parser.add_argument("--stage_eps", type=int, default=50000, help="本階段訓練局數")
+    parser.add_argument("--n_ai", type=int, default=2,
+                        choices=[1, 2, 3, 4],
+                        help="每個環境的 learning agent 數量")
     args = parser.parse_args()
 
-    train(resume_path=args.resume, forced_stage=args.stage, target_stage_eps=args.stage_eps)
+    train(resume_path=args.resume, forced_stage=args.stage,
+          target_stage_eps=args.stage_eps, n_ai=args.n_ai)

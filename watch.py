@@ -1,3 +1,6 @@
+"""
+watch.py — 觀戰腳本（支援多 AI + 通訊向量顯示）
+"""
 import argparse
 import os
 import time
@@ -7,13 +10,22 @@ import pygame
 import torch
 from dataclasses import replace
 
-from ai import ConvSNN, HIDDEN_SIZE
+from ai import ConvLSTM, HIDDEN_SIZE, NUM_COMM
 from game import (
     GameEnv, get_stage_spec,
     WIDTH, HEIGHT, FPS, ROWS, COLS, TILE_SIZE,
 )
+from game.env import NUM_CHANNELS, NUM_SCALARS
 
 FRAME_SKIP = 2
+
+# 各 AI agent 的 FOV 扇形顏色
+FOV_COLORS = [
+    (80, 220, 255),    # agent 0: 青藍
+    (255, 180, 50),    # agent 1: 橙黃
+    (100, 255, 150),   # agent 2: 淡綠
+    (255, 100, 200),   # agent 3: 粉紅
+]
 
 
 def find_cjk_font() -> str | None:
@@ -22,21 +34,16 @@ def find_cjk_font() -> str | None:
     candidates = []
 
     if sys.platform == "win32":
-        # Windows 常見中文字型
         windir = os.environ.get("WINDIR", "C:\\Windows")
         for name in ("msjh.ttc", "mingliu.ttc", "simsun.ttc",
                      "msyh.ttc", "kaiu.ttf"):
             candidates.append(os.path.join(windir, "Fonts", name))
-
     elif sys.platform == "darwin":
-        # macOS
         for name in ("PingFang.ttc", "STHeiti Medium.ttc",
                      "Arial Unicode.ttf", "Hiragino Sans GB.ttc"):
             candidates += glob.glob(f"/System/Library/Fonts/**/{name}", recursive=True)
             candidates += glob.glob(f"/Library/Fonts/{name}")
-
     else:
-        # Linux：先查 fc-list，再 fallback 到常見路徑
         try:
             import subprocess
             out = subprocess.check_output(
@@ -59,10 +66,6 @@ def find_cjk_font() -> str | None:
 
 
 def make_fonts(sizes: dict) -> dict:
-    """
-    回傳 {key: pygame.font.Font} 的字典。
-    sizes = {"normal": 24, "small": 20, "big": 36}
-    """
     cjk = find_cjk_font()
     result = {}
     for key, size in sizes.items():
@@ -75,15 +78,14 @@ def make_fonts(sizes: dict) -> dict:
         result[key] = pygame.font.SysFont(None, size)
     return result
 
-# 可切換的倍速列表，按 [] 鍵循環
-SPEED_STEPS = [0.25, 0.5, 1.0, 2.0, 4.0]
-DEFAULT_SPEED_IDX = 2  # 預設 1.0x
 
-# AI 觀測層面板
-CELL     = 8
-PAD      = 8
-LABEL_H  = 20
-CH_NAMES = ["地形 (Terrain)", "敵人 (Enemy)", "子彈 (Bullet)", "隊友 (Ally)"]
+SPEED_STEPS = [0.25, 0.5, 1.0, 2.0, 4.0]
+DEFAULT_SPEED_IDX = 2
+
+CELL = 8
+PAD = 8
+LABEL_H = 20
+CH_NAMES = ["地形", "敵人", "隊友", "威脅", "聲音", "安全區"]
 
 
 def parse_model_path(ckpt: str) -> str:
@@ -96,27 +98,29 @@ def parse_model_path(ckpt: str) -> str:
 
 def load_model(model_path: str, device):
     payload = torch.load(model_path, map_location=device)
-    model = ConvSNN().to(device)
+    model = ConvLSTM().to(device)
     if isinstance(payload, dict) and "model_state" in payload:
         model.load_state_dict(payload["model_state"])
+        n_ai = payload.get("n_ai", 1)
     else:
         model.load_state_dict(payload)
+        n_ai = 1
     model.eval()
-    return model
+    return model, n_ai
 
 
 def channel_to_surface(data: np.ndarray) -> pygame.Surface:
     ch_px = 15 * CELL
-    surf  = pygame.Surface((ch_px, ch_px))
-    vmax  = float(np.abs(data).max()) or 1e-6
+    surf = pygame.Surface((ch_px, ch_px))
+    vmax = float(np.abs(data).max()) or 1e-6
     for r in range(15):
         for c in range(15):
             v = float(data[r, c])
             if v > 0:
-                t     = v / vmax
+                t = v / vmax
                 color = (int(255 * t), int(180 * t), int(50 * t))
             elif v < 0:
-                t     = -v / vmax
+                t = -v / vmax
                 color = (int(50 * t), int(100 * t), int(255 * t))
             else:
                 color = (20, 20, 30)
@@ -125,69 +129,113 @@ def channel_to_surface(data: np.ndarray) -> pygame.Surface:
 
 
 def draw_ai_panel(screen, view_np, x0, y0, font_sm):
-    ch_px      = 15 * CELL
+    ch_px = 15 * CELL
     col_stride = ch_px + PAD
     row_stride = ch_px + LABEL_H + PAD
-    for ch in range(4):
+    n_ch = min(view_np.shape[0], len(CH_NAMES))
+    for ch in range(n_ch):
         col = ch % 2
         row = ch // 2
-        x   = x0 + col * col_stride
-        y   = y0 + row * row_stride
+        x = x0 + col * col_stride
+        y = y0 + row * row_stride
         screen.blit(font_sm.render(CH_NAMES[ch], True, (200, 200, 200)), (x, y))
         surf = channel_to_surface(view_np[ch])
         screen.blit(surf, (x, y + LABEL_H))
         pygame.draw.rect(screen, (80, 80, 100), (x, y + LABEL_H, ch_px, ch_px), 1)
 
 
+def draw_comm_panel(screen, comm_vecs, x0, y0, font_sm):
+    """繪製通訊向量棒狀圖"""
+    bar_w = 80
+    bar_h = 12
+    gap = 4
+
+    for ai_idx, cv in enumerate(comm_vecs):
+        label = f"A{ai_idx}_comm"
+        screen.blit(font_sm.render(label, True, (200, 200, 200)), (x0, y0))
+        y0 += 18
+
+        for dim_i in range(len(cv)):
+            val = float(cv[dim_i])
+            # 背景
+            pygame.draw.rect(screen, (40, 40, 50),
+                             (x0, y0, bar_w, bar_h))
+            # 值
+            center_x = x0 + bar_w // 2
+            fill_w = int(abs(val) * (bar_w // 2))
+            if val >= 0:
+                color = (80, 140, 255)  # 藍=正
+                pygame.draw.rect(screen, color,
+                                 (center_x, y0, fill_w, bar_h))
+            else:
+                color = (255, 100, 100)  # 紅=負
+                pygame.draw.rect(screen, color,
+                                 (center_x - fill_w, y0, fill_w, bar_h))
+            # 中心線
+            pygame.draw.line(screen, (150, 150, 150),
+                             (center_x, y0), (center_x, y0 + bar_h), 1)
+            y0 += bar_h + gap
+
+        y0 += 8
+
+
 def watch_ai(ckpt: str, stage_id: int,
              max_frames: int = 1200,
-             show_ai_view: bool = False):
+             show_ai_view: bool = False,
+             show_comm: bool = False):
 
     model_path = parse_model_path(ckpt)
     if not os.path.exists(model_path):
         print(f"找不到模型: {model_path}")
         return
 
-    #device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    device = torch.device("cpu")   # 不跟 train 搶 GPU
-    model  = load_model(model_path, device)
+    device = torch.device("cpu")
+    model, n_ai = load_model(model_path, device)
     stage_spec = get_stage_spec(stage_id)
 
-    print(f"載入模型  : {model_path}")
+    print(f"載入模型  : {model_path} (n_ai={n_ai})")
     print(f"觀戰階段  : Stage {stage_id} - {stage_spec.name}")
     print("操作說明  : [Space] 暫停  [] 加速  [] 減速  [Esc] 離開")
 
-    ch_px   = 15 * CELL
+    ch_px = 15 * CELL
     panel_w = 2 * (ch_px + PAD) + PAD if show_ai_view else 0
+    if show_comm:
+        panel_w = max(panel_w, 120)
     total_w = WIDTH + panel_w
 
     pygame.init()
     screen = pygame.display.set_mode((total_w, HEIGHT))
     pygame.display.set_caption(f"Watch – Stage {stage_id}  {stage_spec.name}")
-    clock    = pygame.time.Clock()
-    fonts    = make_fonts({"normal": 24, "small": 20, "big": 36})
-    font     = fonts["normal"]
-    font_sm  = fonts["small"]
+    clock = pygame.time.Clock()
+    fonts = make_fonts({"normal": 24, "small": 20, "big": 36})
+    font = fonts["normal"]
+    font_sm = fonts["small"]
     font_big = fonts["big"]
 
-    env = GameEnv(render_mode=False, stage_id=stage_id, show_fov=True)
-    env.screen     = screen
-    env.font       = font
+    env = GameEnv(render_mode=False, stage_id=stage_id, show_fov=True,
+                  n_learning_agents=n_ai)
+    env.screen = screen
+    env.font = font
     env.stage_spec = replace(env.stage_spec, max_frames=max_frames)
 
-    state = env.reset()
+    result = env.reset()
+    if n_ai == 1:
+        states = [result]
+    else:
+        states = result
 
-    h_ai    = torch.zeros(1, 1, HIDDEN_SIZE, device=device)
-    h_enemy = torch.zeros(1, 1, HIDDEN_SIZE, device=device)
+    # LSTM hidden per agent
+    h_list = [torch.zeros(1, 1, HIDDEN_SIZE, device=device) for _ in range(n_ai)]
+    c_list = [torch.zeros(1, 1, HIDDEN_SIZE, device=device) for _ in range(n_ai)]
+    comm_vecs = [np.zeros(NUM_COMM, dtype=np.float32) for _ in range(n_ai)]
 
-    done         = False
-    step         = 0
-    action       = [0.0] * 9
-    enemy_action = None
-    paused       = False
-    speed_idx    = DEFAULT_SPEED_IDX
-    last_view_np = state[0].copy()
-    last_reward  = 0.0
+    done = False
+    step = 0
+    actions = [[0.0] * 12 for _ in range(n_ai)]
+    paused = False
+    speed_idx = DEFAULT_SPEED_IDX
+    last_view_np = states[0][0].copy() if states else np.zeros((NUM_CHANNELS, 15, 15))
+    last_reward = 0.0
     last_info: dict = {}
 
     def speed_label() -> str:
@@ -208,11 +256,19 @@ def watch_ai(ckpt: str, stage_id: int,
         for a in env.all_agents:
             if a.alive():
                 env._draw_agent(a)
-        env._draw_fov(env.ai_agent)
 
-        ai   = env.ai_agent
+        # 多 AI 各用不同 FOV 顏色
+        for i, la in enumerate(env.learning_agents):
+            if la.alive():
+                color = FOV_COLORS[i % len(FOV_COLORS)]
+                _draw_fov_color(screen, la, color, env.show_fov)
+
+        ai = env.ai_agent
+        wp_name = ""
+        if ai.active_weapon:
+            wp_name = ai.active_weapon.name
         hud1 = (f"Stage {stage_id}  {stage_spec.name}  |"
-                f"  HP:{ai.hp}  Ammo:{ai.ammo}  DashCD:{ai.dash_cd}")
+                f"  HP:{ai.hp}  Ammo:{ai.ammo}  Weapon:{wp_name}")
         hud2 = (f"EnemyAlive:{len(env._alive_enemies())}"
                 f"  AllyAlive:{len([x for x in env.team_agents if x.alive()])}")
         screen.blit(font.render(hud1, True, (255, 255, 255)), (10, 8))
@@ -241,18 +297,24 @@ def watch_ai(ckpt: str, stage_id: int,
             screen.blit(msg, (WIDTH // 2 - msg.get_width() // 2,
                                HEIGHT // 2 - msg.get_height() // 2))
 
-        if show_ai_view:
+        if panel_w > 0:
             pygame.draw.rect(screen, (25, 25, 35), (WIDTH, 0, panel_w, HEIGHT))
+
+        if show_ai_view:
             screen.blit(font.render("AI 觀測層", True, (200, 200, 255)),
                         (WIDTH + PAD, PAD))
             draw_ai_panel(screen, last_view_np, WIDTH + PAD, PAD + 26, font_sm)
 
+        if show_comm:
+            comm_y = PAD + 26
+            if show_ai_view:
+                comm_y += 3 * (15 * CELL + LABEL_H + PAD) + 10
+            draw_comm_panel(screen, comm_vecs, WIDTH + PAD, comm_y, font_sm)
+
         pygame.display.flip()
 
-    # 用累積時間來決定本幀要推進幾步遊戲邏輯，
-    # 這樣低倍速時不會丟幀，高倍速時也不會跑太快。
     accumulated = 0.0
-    last_tick   = time.perf_counter()
+    last_tick = time.perf_counter()
 
     while True:
         speed = SPEED_STEPS[speed_idx]
@@ -267,57 +329,66 @@ def watch_ai(ckpt: str, stage_id: int,
                     return
                 elif event.key == pygame.K_SPACE:
                     paused = not paused
-                    last_tick = time.perf_counter()   # 暫停後重置，避免解除後爆衝
+                    last_tick = time.perf_counter()
                     accumulated = 0.0
-                elif event.key == pygame.K_RIGHTBRACKET:  # ] 加速
+                elif event.key == pygame.K_RIGHTBRACKET:
                     speed_idx = min(speed_idx + 1, len(SPEED_STEPS) - 1)
-                elif event.key == pygame.K_LEFTBRACKET:   # [ 減速
+                elif event.key == pygame.K_LEFTBRACKET:
                     speed_idx = max(speed_idx - 1, 0)
 
-        now     = time.perf_counter()
-        dt      = now - last_tick
+        now = time.perf_counter()
+        dt = now - last_tick
         last_tick = now
 
         if not paused and not done:
-            # 把渲染幀的實際時間 × 倍速 累積成「遊戲時間」
             accumulated += dt * speed
-
-            # 每累積夠 1/FPS 秒的遊戲時間，就推進一步遊戲邏輯
             game_frame_time = 1.0 / FPS
+
             while accumulated >= game_frame_time and not done:
                 accumulated -= game_frame_time
 
                 if step % FRAME_SKIP == 0:
-                    with torch.no_grad():
-                        s0 = torch.tensor(
-                            state[0], dtype=torch.float32).unsqueeze(0).to(device)
-                        s1 = torch.tensor(
-                            state[1], dtype=torch.float32).unsqueeze(0).to(device)
-                        logits, _, h_ai = model(s0, s1, h_ai)
-                        probs  = torch.sigmoid(logits[0])
-                        action = (probs > 0.5).float().cpu().tolist()
-                        last_view_np = state[0].copy()
+                    new_actions = []
+                    for i in range(n_ai):
+                        with torch.no_grad():
+                            s0 = torch.tensor(
+                                states[i][0], dtype=torch.float32
+                            ).unsqueeze(0).to(device)
+                            s1 = torch.tensor(
+                                states[i][1], dtype=torch.float32
+                            ).unsqueeze(0).to(device)
+                            logits, mu, logstd, _, (h_new, c_new) = model(
+                                s0, s1, (h_list[i], c_list[i]))
+                            probs = torch.sigmoid(logits[0])
+                            act = (probs > 0.5).float().cpu().tolist()
+                            comm_vecs[i] = mu[0].cpu().numpy()
+                            h_list[i] = h_new
+                            c_list[i] = c_new
+                        new_actions.append(act)
 
-                        if stage_id == 5:
-                            logits_e, _, h_enemy = model(s0, s1, h_enemy)
-                            probs_e      = torch.sigmoid(logits_e[0])
-                            enemy_action = (probs_e > 0.5).float().cpu().tolist()
+                    actions = new_actions
+                    last_view_np = states[0][0].copy()
 
-                state, last_reward, done, last_info = env.step(
-                    action, enemy_ai_action=enemy_action, frame_skip=1)
+                result = env.step(actions, frame_skip=1)
+                if n_ai == 1:
+                    state_out, last_reward, done, last_info = result
+                    states = [state_out]
+                else:
+                    states_out, rewards_out, done, last_info = result
+                    states = states_out
+                    last_reward = sum(rewards_out) / len(rewards_out) if rewards_out else 0.0
                 step += 1
 
         draw_frame()
-        # 渲染幀率固定在 FPS，倍速由遊戲邏輯步數控制
         clock.tick(FPS)
 
         if done:
-            result = ("勝利" if last_info.get("ai_win")
-                      else ("失敗" if last_info.get("ai_lost")
-                            else "平局"))
+            result_str = ("勝利" if last_info.get("ai_win")
+                          else ("失敗" if last_info.get("ai_lost")
+                                else "平局"))
             draw_frame()
             end_msg = font_big.render(
-                f"結束：{result}    [任意鍵] 離開", True, (255, 220, 50))
+                f"結束：{result_str}    [任意鍵] 離開", True, (255, 220, 50))
             screen.blit(end_msg, (WIDTH // 2 - end_msg.get_width() // 2,
                                    HEIGHT // 2 - end_msg.get_height() // 2))
             pygame.display.flip()
@@ -331,8 +402,35 @@ def watch_ai(ckpt: str, stage_id: int,
                 clock.tick(10)
 
             pygame.quit()
-            print(f"觀戰結束：{result}")
+            print(f"觀戰結束：{result_str}")
             return
+
+
+def _draw_fov_color(screen, agent, color, show_fov):
+    """繪製指定顏色的 FOV 扇形"""
+    if not show_fov:
+        return
+    import math
+    from game.config import FOV_DEGREES, HALF_FOV, VIEW_RANGE
+    rad = math.radians(agent.angle)
+    fwd_x, fwd_y = math.cos(rad), math.sin(rad)
+    rgt_x, rgt_y = math.cos(rad + math.pi / 2), math.sin(rad + math.pi / 2)
+    view_r = float(VIEW_RANGE)
+    pts = [(agent.x, agent.y)]
+    steps = 60
+    for i in range(steps + 1):
+        deg_rel = -HALF_FOV + (FOV_DEGREES * i / steps)
+        rad_rel = math.radians(deg_rel)
+        cos_rel = math.cos(rad_rel)
+        sin_rel = math.sin(rad_rel)
+        ft_val = view_r * cos_rel
+        rt_val = view_r * sin_rel
+        wx = agent.x + (fwd_x * ft_val + rgt_x * rt_val) * TILE_SIZE
+        wy = agent.y + (fwd_y * ft_val + rgt_y * rt_val) * TILE_SIZE
+        pts.append((wx, wy))
+    pts.append((agent.x, agent.y))
+    if len(pts) > 2:
+        pygame.draw.lines(screen, color, True, pts, 1)
 
 
 def main():
@@ -345,14 +443,17 @@ def main():
     parser.add_argument("--max_frames", type=int, default=1200,
                         help="遊戲最大幀數上限")
     parser.add_argument("--ai_view", action="store_true",
-                        help="在右側顯示 AI 四通道觀測層")
+                        help="在右側顯示 AI 觀測層")
+    parser.add_argument("--show_comm", action="store_true",
+                        help="在右側顯示通訊向量棒狀圖")
     args = parser.parse_args()
 
     watch_ai(
-        ckpt         = args.ckpt,
-        stage_id     = args.stage,
-        max_frames   = args.max_frames,
-        show_ai_view = args.ai_view,
+        ckpt=args.ckpt,
+        stage_id=args.stage,
+        max_frames=args.max_frames,
+        show_ai_view=args.ai_view,
+        show_comm=args.show_comm,
     )
 
 

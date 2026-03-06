@@ -342,10 +342,19 @@ def can_agent_see_target(env, observer, target):
             and env.has_line_of_sight(observer.x, observer.y, target.x, target.y))
 
 
+def _find_closest_target(env, enemy):
+    """找出最近的存活敵對 learning agent"""
+    candidates = [a for a in env.learning_agents
+                  if a.alive() and a.team_id != enemy.team_id]
+    if not candidates:
+        return None
+    return min(candidates, key=lambda a: math.hypot(a.x - enemy.x, a.y - enemy.y))
+
+
 def combat_npc_actions(env, enemy):
     """Stage 3 / 4 的主要 NPC 行為狀態機。"""
-    target = env.ai_agent
-    if not target.alive() or not enemy.alive():
+    target = _find_closest_target(env, enemy)
+    if target is None or not enemy.alive():
         return [0.0] * NUM_ACTIONS
 
     hp_ratio = enemy.hp / max(1, enemy.max_hp)
@@ -401,7 +410,12 @@ def enemy_actions(env, enemy):
     if not enemy.alive():
         return [0.0] * NUM_ACTIONS
 
-    target = env.ai_agent
+    candidates = [a for a in env.learning_agents
+                  if a.alive() and a.team_id != enemy.team_id]
+    if not candidates:
+        return [0.0] * NUM_ACTIONS
+    target = min(candidates,
+                 key=lambda a: math.hypot(a.x - enemy.x, a.y - enemy.y))
 
     if enemy.bot_type == "dummy":
         return [0.0] * NUM_ACTIONS

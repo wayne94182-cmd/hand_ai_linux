@@ -812,6 +812,7 @@ class GameEnv:
             "ally_alive_count": len([a for a in self.team_agents if a.alive()]),
             "ai_kill_target": ai_win,
             "kill_count": self.stage_spec.enemy_count - alive_enemy_cnt,
+            "action_masks": [a.get_action_mask() for a in self.learning_agents],
         }
         self._last_info = info
 
