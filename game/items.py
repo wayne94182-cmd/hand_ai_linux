@@ -66,8 +66,7 @@ def try_auto_pickup(agent, ground_items: list, pickup_radius: float = 40.0) -> l
     對 ground_items 中距離 agent 夠近的道具嘗試自動拾取。
 
     武器：背包未滿（<2 槽）時直接拾取；
-          已滿時若地面武器比手上最差的武器「更好」（依 damage 判斷），
-          自動丟棄最差武器，改拾取新武器（rule-based，不需 AI 決策）。
+          背包已滿時不拾取，由 AI 自行決定。
     藥包：medkits < max_medkits 時拾取。
     手榴彈：grenades < max_grenades 時拾取。
 
@@ -91,32 +90,7 @@ def try_auto_pickup(agent, ground_items: list, pickup_radius: float = 40.0) -> l
                 agent.reload_delay = wp.reload_frames
                 picked_up.append(item)
             else:
-                # 背包已滿 → 找到最差武器（damage 最低）
-                worst_idx = 0
-                worst_dmg = agent.weapon_slots[0].damage if agent.weapon_slots[0] else 0
-                for i, slot in enumerate(agent.weapon_slots):
-                    d = slot.damage if slot else 0
-                    if d < worst_dmg:
-                        worst_dmg = d
-                        worst_idx = i
-                # 地面武器比最差武器更好才拾取
-                if wp.damage > worst_dmg:
-                    # 丟棄最差武器，產生掉落物放回 ground_items
-                    dropped_wp = agent.weapon_slots[worst_idx]
-                    if dropped_wp is not None:
-                        dropped_item = GroundItem(
-                            x=agent.x, y=agent.y,
-                            item_type="weapon",
-                            weapon_spec=dropped_wp,
-                        )
-                        ground_items.append(dropped_item)
-                    agent.weapon_slots[worst_idx] = wp
-                    # 若替換的是目前持有的武器，同步彈藥數據
-                    if worst_idx == agent.active_slot:
-                        agent.ammo = wp.mag_size
-                        agent.max_ammo = wp.mag_size
-                        agent.reload_delay = wp.reload_frames
-                    picked_up.append(item)
+                continue  # 背包滿，不自動替換，由 AI 自己決定
 
         elif item.item_type == "medkit":
             if agent.medkits < agent.max_medkits:

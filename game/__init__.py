@@ -17,11 +17,18 @@ from game.entities import (
     Agent, Projectile, Grenade,
 )
 
-from game.env import GameEnv
+from game.items import (
+    WeaponSpec, PISTOL, RIFLE, SHOTGUN, SNIPER, WEAPON_TYPES,
+    GroundItem, try_auto_pickup,
+)
+
+from game.audio import SoundWave
+
+from game.env import GameEnv, NUM_CHANNELS, NUM_SCALARS
 
 
 if __name__ == "__main__":
-    from game import GameEnv, get_stage_spec, MAPS
-    env = GameEnv(render_mode=False, stage_id=0)
-    s = env.reset()
-    print("重構成功，狀態形狀:", s[0].shape, s[1].shape)
+    env = GameEnv(render_mode=False, stage_id=1)
+    states = env.reset()
+    view, sc = states[0] if isinstance(states, list) else states
+    print("重構成功，view:", view.shape, "scalars:", sc.shape)
