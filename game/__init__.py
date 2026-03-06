@@ -13,9 +13,11 @@ from game.maps import (
     ALL_MAPS, MAPS, SMALL_MAPS,
 )
 
-from game.env import (
-    Agent, Projectile, GameEnv,
+from game.entities import (
+    Agent, Projectile, Grenade,
 )
+
+from game.env import GameEnv
 
 
 if __name__ == "__main__":
