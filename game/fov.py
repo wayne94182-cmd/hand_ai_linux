@@ -119,7 +119,6 @@ def njit_has_line_of_sight(x1, y1, x2, y2, grid_np, tile_size, cols, rows):
         if 0 <= tc < cols and 0 <= tr < rows:
             if grid_np[tr, tc] == 1:
                 return False
-            # 對角縫隙檢查：射線跨對角格時，兩個側邊格都是牆才擋住（避免 L 型角落誤擋）
             if tc != prev_tc and tr != prev_tr:
                 b_wall = (0 <= prev_tc < cols and 0 <= tr < rows and grid_np[tr, prev_tc] == 1)
                 c_wall = (0 <= tc < cols and 0 <= prev_tr < rows and grid_np[prev_tr, tc] == 1)
@@ -132,25 +131,13 @@ def njit_has_line_of_sight(x1, y1, x2, y2, grid_np, tile_size, cols, rows):
     return True
 
 
+# ─── 通用 FOV 計算核心（接受 tables 作為參數）───
+
 @njit(cache=True)
 def njit_compute_fov(
-    ax,
-    ay,
-    fwd_x,
-    fwd_y,
-    rgt_x,
-    rgt_y,
-    grid_np,
-    fov_rc_np,
-    fov_fwd,
-    fov_right,
-    ray_flat,
-    ray_offsets,
-    ray_lengths,
-    tile_size,
-    cols,
-    rows,
-    view_size,
+    ax, ay, fwd_x, fwd_y, rgt_x, rgt_y, grid_np,
+    fov_rc_np, fov_fwd, fov_right, ray_flat, ray_offsets, ray_lengths,
+    tile_size, cols, rows, view_size,
 ):
     ch0 = np.full((view_size, view_size), -1.0, dtype=np.float32)
     n = fov_rc_np.shape[0]
@@ -187,7 +174,6 @@ def njit_compute_fov(
                 if grid_np[ir, ic] == 1:
                     blocked = True
                     break
-                # 對角縫隙檢查：射線跨對角格時，兩個側邊格都是牆才擋住（避免 L 型角落誤擋）
                 if ic != prev_ic and ir != prev_ir:
                     b_wall = (0 <= prev_ic < cols and 0 <= ir < rows and grid_np[ir, prev_ic] == 1)
                     c_wall = (0 <= ic < cols and 0 <= prev_ir < rows and grid_np[prev_ir, ic] == 1)
@@ -204,3 +190,86 @@ def njit_compute_fov(
             ch0[r_idx, c_idx] = float(grid_np[tr_v, tc])
 
     return ch0
+
+
+# ─── 專用函式：各自帶入預綁定的 tables，Numba 只編譯一次 ───
+
+@njit(cache=True)
+def _njit_compute_fov_core(
+    ax, ay, fwd_x, fwd_y, rgt_x, rgt_y, grid_np,
+    fov_rc_np, fov_fwd, fov_right, ray_flat, ray_offsets, ray_lengths,
+    tile_size, cols, rows, view_size,
+):
+    ch0 = np.full((view_size, view_size), -1.0, dtype=np.float32)
+    n = fov_rc_np.shape[0]
+
+    for k in range(n):
+        r_idx = fov_rc_np[k, 0]
+        c_idx = fov_rc_np[k, 1]
+        ft = fov_fwd[k]
+        rt = fov_right[k]
+
+        wx = ax + fwd_x * ft * tile_size + rgt_x * rt * tile_size
+        wy = ay + fwd_y * ft * tile_size + rgt_y * rt * tile_size
+
+        tc = int(wx // tile_size)
+        tr_v = int(wy // tile_size)
+
+        if not (0 <= tc < cols and 0 <= tr_v < rows):
+            ch0[r_idx, c_idx] = 1.0
+            continue
+
+        off = ray_offsets[k]
+        l = ray_lengths[k]
+        blocked = False
+        prev_ic = int(ax // tile_size)
+        prev_ir = int(ay // tile_size)
+        for j in range(l):
+            fft = ray_flat[off + j, 0]
+            rrt = ray_flat[off + j, 1]
+            ix = ax + fwd_x * fft * tile_size + rgt_x * rrt * tile_size
+            iy = ay + fwd_y * fft * tile_size + rgt_y * rrt * tile_size
+            ic = int(ix // tile_size)
+            ir = int(iy // tile_size)
+            if 0 <= ic < cols and 0 <= ir < rows:
+                if grid_np[ir, ic] == 1:
+                    blocked = True
+                    break
+                if ic != prev_ic and ir != prev_ir:
+                    b_wall = (0 <= prev_ic < cols and 0 <= ir < rows and grid_np[ir, prev_ic] == 1)
+                    c_wall = (0 <= ic < cols and 0 <= prev_ir < rows and grid_np[prev_ir, ic] == 1)
+                    if b_wall and c_wall:
+                        blocked = True
+                        break
+            else:
+                blocked = True
+                break
+            prev_ic = ic
+            prev_ir = ir
+
+        if not blocked:
+            ch0[r_idx, c_idx] = float(grid_np[tr_v, tc])
+
+    return ch0
+
+
+def njit_compute_fov_standard(ax, ay, fwd_x, fwd_y, rgt_x, rgt_y,
+                               grid_np, tile_size, cols, rows, view_size):
+    """標準 FOV — 使用預綁定的 standard tables"""
+    return _njit_compute_fov_core(
+        ax, ay, fwd_x, fwd_y, rgt_x, rgt_y, grid_np,
+        _FOV_RC_NP, _FOV_FWD, _FOV_RIGHT,
+        _RAY_FLAT, _RAY_OFFSETS, _RAY_LENGTHS,
+        tile_size, cols, rows, view_size,
+    )
+
+
+def njit_compute_fov_sniper(ax, ay, fwd_x, fwd_y, rgt_x, rgt_y,
+                             grid_np, tile_size, cols, rows, view_size):
+    """狙擊 FOV — 使用預綁定的 sniper tables"""
+    return _njit_compute_fov_core(
+        ax, ay, fwd_x, fwd_y, rgt_x, rgt_y, grid_np,
+        _SNIPER_FOV_RC_NP, _SNIPER_FOV_FWD, _SNIPER_FOV_RIGHT,
+        _SNIPER_RAY_FLAT, _SNIPER_RAY_OFFSETS, _SNIPER_RAY_LENGTHS,
+        tile_size, cols, rows, view_size,
+    )

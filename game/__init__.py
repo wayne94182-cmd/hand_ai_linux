@@ -24,11 +24,16 @@ from game.items import (
 
 from game.audio import SoundWave
 
+from game.fov import (
+    njit_compute_fov_standard, njit_compute_fov_sniper,
+)
+
 from game.env import GameEnv, NUM_CHANNELS, NUM_SCALARS
 
 
 if __name__ == "__main__":
     env = GameEnv(render_mode=False, stage_id=1)
     states = env.reset()
-    view, sc = states[0] if isinstance(states, list) else states
-    print("重構成功，view:", view.shape, "scalars:", sc.shape)
+    r = states[0] if isinstance(states, list) else states
+    view, sc, tid = r
+    print("重構成功，view:", view.shape, "scalars:", sc.shape, "team_id:", tid)

@@ -2,6 +2,7 @@
 train.py — MAPPO + N-Agent Flatten 訓練腳本
 支援多個 learning agents、LSTM 隱藏狀態管理、
 通訊向量、action masking、以及分離的 Actor / Critic 優化。
+修正：feat.detach / action masking / comm team filter / critic team grouping
 """
 import argparse
 import logging
@@ -169,7 +170,6 @@ class VecEnv:
             _ = r.recv()
 
     def step_async(self, actions_per_env, frame_skip):
-        """actions_per_env[j] = list of N_AI actions for env j"""
         for i, r in enumerate(self.remotes):
             r.send(("step", (actions_per_env[i], frame_skip)))
         self.waiting = True
@@ -317,7 +317,10 @@ def train(resume_path=None, forced_stage=None, target_stage_eps=50000, n_ai=2):
 
         # 重置所有環境
         env_states = vec_env.reset()
-        # env_states[j] = list of n_ai (view, scalar) tuples
+        # env_states[j] = list of n_ai (view, scalar, team_id) tuples
+
+        # 追蹤每個 flat index 目前的 action mask
+        last_masks = np.ones((FLAT_BATCH, 12), dtype=bool)
 
         # 軌跡收集（per flat index）
         traj = [{"states": [], "actions": [], "rewards": [], "values": [],
@@ -332,10 +335,12 @@ def train(resume_path=None, forced_stage=None, target_stage_eps=50000, n_ai=2):
             # 1. 從 NUM_ENVS 個環境收集狀態
             s_np = np.zeros((NUM_ENVS, n_ai, NUM_CHANNELS, 15, 15), dtype=np.float32)
             sc_np = np.zeros((NUM_ENVS, n_ai, NUM_SCALARS), dtype=np.float32)
+            team_ids = np.zeros((NUM_ENVS, n_ai), dtype=np.int32)
             for j in range(NUM_ENVS):
                 for i in range(n_ai):
                     s_np[j, i] = env_states[j][i][0]
                     sc_np[j, i] = env_states[j][i][1]
+                    team_ids[j, i] = int(env_states[j][i][2])
 
             # 2. 展平：先 AI index，再 env index
             s_flat = s_np.transpose(1, 0, 2, 3, 4).reshape(FLAT_BATCH, NUM_CHANNELS, 15, 15)
@@ -344,16 +349,18 @@ def train(resume_path=None, forced_stage=None, target_stage_eps=50000, n_ai=2):
             s_t = torch.as_tensor(s_flat, dtype=torch.float32, device=device)
             sc_t = torch.as_tensor(sc_flat, dtype=torch.float32, device=device)
 
-            # 3. 準備 comm_in (FLAT_BATCH, K, NUM_COMM)
-            # K = n_ai - 1（同 env、同 team、不同 agent）
+            # 3. 準備 comm_in — 只傳同 env、同 team、不同 agent (Fix 5)
             K = max(0, n_ai - 1)
             comm_in_np = np.zeros((FLAT_BATCH, K, NUM_COMM), dtype=np.float32)
             for i in range(n_ai):
                 for j in range(NUM_ENVS):
                     flat_idx = i * NUM_ENVS + j
+                    my_team = team_ids[j, i]
                     k_idx = 0
                     for i2 in range(n_ai):
                         if i2 == i:
+                            continue
+                        if team_ids[j, i2] != my_team:  # 不同 team 跳過
                             continue
                         flat_other = i2 * NUM_ENVS + j
                         if k_idx < K:
@@ -371,12 +378,13 @@ def train(resume_path=None, forced_stage=None, target_stage_eps=50000, n_ai=2):
                 logits = logits.float()
                 feat = feat.float()
 
-                # Critic value
-                # 簡化：stage 0-4 全部 team 0，直接用 feat
-                v = critic(feat)  # (FLAT_BATCH,)
+                # Fix 1: Critic 使用 feat.detach()
+                v = critic(feat.detach())  # (FLAT_BATCH,)
 
-                # 5. 取樣動作
-                dist_disc = Bernoulli(torch.sigmoid(logits))
+                # Fix 2: Action Masking 在 rollout 取樣時
+                mask_t = torch.as_tensor(last_masks, dtype=torch.bool, device=device)
+                logits_masked = logits.masked_fill(~mask_t, -1e9)
+                dist_disc = Bernoulli(torch.sigmoid(logits_masked))
                 acts = dist_disc.sample()
                 lp_disc = dist_disc.log_prob(acts).sum(dim=1)
 
@@ -400,10 +408,10 @@ def train(resume_path=None, forced_stage=None, target_stage_eps=50000, n_ai=2):
                         continue
                     flat = i * NUM_ENVS + j
                     traj[flat]["states"].append((
-                        torch.from_numpy(s_flat[flat]),
-                        torch.from_numpy(sc_flat[flat]),
+                        torch.from_numpy(s_flat[flat].copy()),
+                        torch.from_numpy(sc_flat[flat].copy()),
                     ))
-                    traj[flat]["actions"].append(torch.from_numpy(acts_np[flat]))
+                    traj[flat]["actions"].append(torch.from_numpy(acts_np[flat].copy()))
                     traj[flat]["values"].append(float(vals_np[flat]))
                     traj[flat]["old_lp"].append(float(lp_disc_np[flat]))
                     traj[flat]["comm_acts"].append(
@@ -414,7 +422,7 @@ def train(resume_path=None, forced_stage=None, target_stage_eps=50000, n_ai=2):
                     traj[flat]["comm_logstd"].append(
                         torch.from_numpy(logstd_np[flat].copy()))
                     traj[flat]["masks"].append(
-                        torch.ones(12, dtype=torch.bool))  # placeholder
+                        torch.from_numpy(last_masks[flat].copy()))
 
             # 6. 還原形狀派發給 env
             acts_env = acts_np.reshape(n_ai, NUM_ENVS, 12).transpose(1, 0, 2)
@@ -431,11 +439,17 @@ def train(resume_path=None, forced_stage=None, target_stage_eps=50000, n_ai=2):
             for j in range(NUM_ENVS):
                 if episode_done[j]:
                     continue
-                # 存 reward（per flat）
+                # 存 reward
                 for i in range(n_ai):
                     flat = i * NUM_ENVS + j
                     rew = all_rewards[j][i] if isinstance(all_rewards[j], list) else all_rewards[j]
                     traj[flat]["rewards"].append(float(rew))
+
+                # Fix 2B: 從 info 取回真實 action mask
+                raw_masks = infos[j].get("action_masks", [[True]*12]*n_ai)
+                for i in range(n_ai):
+                    flat = i * NUM_ENVS + j
+                    last_masks[flat] = np.array(raw_masks[i], dtype=bool) if i < len(raw_masks) else np.ones(12, dtype=bool)
 
                 if dones[j]:
                     episode_done[j] = True
@@ -445,6 +459,7 @@ def train(resume_path=None, forced_stage=None, target_stage_eps=50000, n_ai=2):
                         h[:, flat, :] = 0.0
                         c[:, flat, :] = 0.0
                         last_comm[flat] = 0.0
+                        last_masks[flat] = True  # reset masks
                     env_kills[j] = infos[j].get("kill_count", 0)
                     env_wins[j] = 1 if infos[j].get("ai_win", False) else 0
                 else:
@@ -487,6 +502,7 @@ def train(resume_path=None, forced_stage=None, target_stage_eps=50000, n_ai=2):
         bat_comm_lp = torch.zeros(max_t, FLAT_BATCH)
         bat_comm_mu = torch.zeros(max_t, FLAT_BATCH, NUM_COMM)
         bat_comm_logstd = torch.zeros(max_t, FLAT_BATCH, NUM_COMM)
+        bat_masks = torch.ones(max_t, FLAT_BATCH, 12, dtype=torch.bool)
         mask = torch.zeros(max_t, FLAT_BATCH, dtype=torch.bool)
 
         for f in range(FLAT_BATCH):
@@ -505,6 +521,8 @@ def train(resume_path=None, forced_stage=None, target_stage_eps=50000, n_ai=2):
                 bat_comm_lp[:t_i, f] = torch.tensor(traj[f]["comm_lp"])
                 bat_comm_mu[:t_i, f] = torch.stack(traj[f]["comm_mu"])
                 bat_comm_logstd[:t_i, f] = torch.stack(traj[f]["comm_logstd"])
+            if traj[f]["masks"]:
+                bat_masks[:t_i, f] = torch.stack(traj[f]["masks"])
 
         bat_states = bat_states.to(device)
         bat_scalars = bat_scalars.to(device)
@@ -516,7 +534,15 @@ def train(resume_path=None, forced_stage=None, target_stage_eps=50000, n_ai=2):
         bat_comm_lp = bat_comm_lp.to(device)
         bat_comm_mu = bat_comm_mu.to(device)
         bat_comm_logstd = bat_comm_logstd.to(device)
+        bat_masks = bat_masks.to(device)
         mask = mask.to(device)
+
+        # Fix 7: 預計算每個 flat index 的 team_id（用最後一次觀測到的 team）
+        flat_team_ids = np.zeros(FLAT_BATCH, dtype=np.int32)
+        for i in range(n_ai):
+            for j in range(NUM_ENVS):
+                flat = i * NUM_ENVS + j
+                flat_team_ids[flat] = int(env_states[j][i][2]) if env_states[j][i] is not None else 0
 
         # ── PPO 更新 ──
         model.train()
@@ -539,6 +565,7 @@ def train(resume_path=None, forced_stage=None, target_stage_eps=50000, n_ai=2):
                 m_t = mask[t]
                 old_ca = bat_comm_acts[t]
                 old_clp = bat_comm_lp[t]
+                m_act = bat_masks[t]   # (FLAT_BATCH, 12) action masks
 
                 if not m_t.any():
                     with torch.no_grad():
@@ -554,8 +581,9 @@ def train(resume_path=None, forced_stage=None, target_stage_eps=50000, n_ai=2):
                 logits = logits.float()
                 feat = feat.float()
 
-                # 離散動作
-                probs = torch.sigmoid(logits)
+                # Fix 2D: Action Masking 在 PPO update 時
+                logits_masked = logits.masked_fill(~m_act, -1e9)
+                probs = torch.sigmoid(logits_masked)
                 dist_d = Bernoulli(probs)
                 new_lp = dist_d.log_prob(a).sum(dim=1)
                 entropy_d = dist_d.entropy().sum(dim=1)
@@ -583,9 +611,35 @@ def train(resume_path=None, forced_stage=None, target_stage_eps=50000, n_ai=2):
                 t_actor = (total_actor * valid).sum() / n_valid
                 ep_actor_losses.append(t_actor)
 
-                # Critic loss
-                v_pred = critic(feat)
-                critic_l = (v_pred - ret).pow(2)
+                # Fix 1+7: Critic 使用 feat.detach()，按 team_id 分組
+                feat_d = feat.detach()
+                # 簡化分組：收集 team 0 和 team 1 的 feat
+                team0_idx = [f for f in range(FLAT_BATCH) if m_t[f] and flat_team_ids[f] == 0]
+                team1_idx = [f for f in range(FLAT_BATCH) if m_t[f] and flat_team_ids[f] == 1]
+
+                if team0_idx:
+                    t0_feat = feat_d[team0_idx]  # (N0, 256)
+                else:
+                    t0_feat = torch.zeros(1, HIDDEN_SIZE, device=device)
+                if team1_idx:
+                    t1_feat = feat_d[team1_idx]  # (N1, 256)
+                else:
+                    t1_feat = None
+
+                # 計算 value — 所有 valid agent 共享同一個 critic output
+                # 但每個 agent 各自用自己 team 的 pool
+                v_pred_all = torch.zeros(FLAT_BATCH, device=device)
+                if team0_idx:
+                    v0 = critic(t0_feat, t1_feat)
+                    for idx_i, fi in enumerate(team0_idx):
+                        v_pred_all[fi] = v0[idx_i]
+                if team1_idx:
+                    # team1 的 critic：team1 在左，team0 在右
+                    v1 = critic(t1_feat, t0_feat if team0_idx else None)
+                    for idx_i, fi in enumerate(team1_idx):
+                        v_pred_all[fi] = v1[idx_i]
+
+                critic_l = (v_pred_all - ret).pow(2)
                 t_critic = (critic_l * valid).sum() / n_valid
                 ep_critic_losses.append(t_critic)
 

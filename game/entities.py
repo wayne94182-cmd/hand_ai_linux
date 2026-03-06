@@ -109,14 +109,8 @@ class Agent:
                 self.ammo = self.max_ammo
                 self.reload_timer = 0
 
-    def _regen_tick(self, fwd_in, right_in):
-        if fwd_in == 0 and right_in == 0:
-            self.regen_timer += 1
-            if self.regen_timer >= 240:
-                self.hp = min(self.max_hp, self.hp + GameConfig.REGEN_AMOUNT)
-                self.regen_timer = 0
-        else:
-            self.regen_timer = 0
+    def _regen_tick(self, fwd_in=0, right_in=0):
+        pass  # 回血機制已停用
 
     # ── 動作執行（原有邏輯完全保留）──
 

@@ -21,6 +21,7 @@ from game.maps import MAPS, SMALL_MAPS
 from game.fov import (
     _FOV_RC_NP, _FOV_FWD, _FOV_RIGHT, _RAY_FLAT, _RAY_OFFSETS, _RAY_LENGTHS,
     njit_has_line_of_sight, njit_compute_fov,
+    njit_compute_fov_standard, njit_compute_fov_sniper,
     get_fov_tables,
 )
 from game.entities import Agent, Projectile, Grenade
@@ -72,6 +73,7 @@ class GameEnv:
         self.sound_waves: List[SoundWave] = []
 
         self.frame_count = 0
+        self._prev_frame = 0
         self._last_info = {}
 
         self.screen = None
@@ -312,27 +314,29 @@ class GameEnv:
         rgt_x, rgt_y = math.cos(rad + math.pi / 2), math.sin(rad + math.pi / 2)
         ax, ay = agent.x, agent.y
 
-        # 若持狙擊槍，使用 sniper FOV tables
+        # 若持狙擊槍，使用 sniper FOV
         wp = agent.active_weapon
         use_sniper = wp is not None and wp.is_sniper
-        if use_sniper:
-            fov_rc, fov_fwd, fov_rgt, ray_flat, ray_off, ray_len = get_fov_tables(sniper=True)
-        else:
-            fov_rc, fov_fwd, fov_rgt, ray_flat, ray_off, ray_len = (
-                _FOV_RC_NP, _FOV_FWD, _FOV_RIGHT, _RAY_FLAT, _RAY_OFFSETS, _RAY_LENGTHS,
-            )
 
         view = np.zeros((NUM_CHANNELS, VIEW_SIZE, VIEW_SIZE), dtype=np.float32)
 
-        # Ch0: 地形
-        view[0] = njit_compute_fov(
-            float(ax), float(ay),
-            float(fwd_x), float(fwd_y),
-            float(rgt_x), float(rgt_y),
-            self.grid_np,
-            fov_rc, fov_fwd, fov_rgt, ray_flat, ray_off, ray_len,
-            float(TILE_SIZE), COLS, ROWS, VIEW_SIZE,
-        )
+        # Ch0: 地形（使用專用函式避免 Numba 重編譯）
+        if use_sniper:
+            view[0] = njit_compute_fov_sniper(
+                float(ax), float(ay),
+                float(fwd_x), float(fwd_y),
+                float(rgt_x), float(rgt_y),
+                self.grid_np,
+                float(TILE_SIZE), COLS, ROWS, VIEW_SIZE,
+            )
+        else:
+            view[0] = njit_compute_fov_standard(
+                float(ax), float(ay),
+                float(fwd_x), float(fwd_y),
+                float(rgt_x), float(rgt_y),
+                self.grid_np,
+                float(TILE_SIZE), COLS, ROWS, VIEW_SIZE,
+            )
 
         # Ch1: 敵人雷達（team_id 不同、在 FOV + LOS）
         for other in self.all_agents:
@@ -399,10 +403,12 @@ class GameEnv:
                 dc = (ft - rt) / 1.41421356
                 self._inject_value(view[3], VIEW_CENTER + dr, VIEW_CENTER + dc, val)
 
-        # Ch4: 聲音波紋
+        # Ch4: 聲音波紋（逐幀掃描避免 frame_skip 跳格）
         view[4] = render_sound_channel(
             ax, ay, fwd_x, fwd_y, rgt_x, rgt_y,
             self.sound_waves,
+            current_frame=self.frame_count,
+            prev_frame=self._prev_frame,
             view_size=VIEW_SIZE, view_center=VIEW_CENTER, tile_size=TILE_SIZE,
         )
 
@@ -468,7 +474,7 @@ class GameEnv:
             dtype=np.float32,
         )
 
-        return view, scalars
+        return view, scalars, agent.team_id
 
     # ═══════════════════════════════════════════════════════
     #  輔助查詢
@@ -574,17 +580,18 @@ class GameEnv:
             agent.attack_cooldown = wp.fire_cooldown
             if not agent.infinite_ammo:
                 agent.ammo -= 1
-            self.sound_waves.append(create_gunshot_wave(agent.x, agent.y))
+            self.sound_waves.append(create_gunshot_wave(agent.x, agent.y, self.frame_count))
             return True, dash_reward
 
         # 一般開火（含狙擊、步槍、手槍）
         did_shoot, dash_reward = agent.apply_actions(actions_9, self)
         if did_shoot:
-            self.sound_waves.append(create_gunshot_wave(agent.x, agent.y))
+            self.sound_waves.append(create_gunshot_wave(agent.x, agent.y, self.frame_count))
 
         return did_shoot, dash_reward
 
     def _single_step(self, ai_actions_list, enemy_ai_action=None):
+        self._prev_frame = self.frame_count
         self.frame_count += 1
 
         # 填入 comm_in
@@ -626,13 +633,10 @@ class GameEnv:
         if self.frame_count % 20 == 0:
             for agent in self.learning_agents + self.enemy_agents:
                 if agent.alive():
-                    self.sound_waves.append(create_footstep_wave(agent.x, agent.y))
+                    self.sound_waves.append(create_footstep_wave(agent.x, agent.y, self.frame_count))
 
-        # 更新聲音波紋
-        for w in self.sound_waves[:]:
-            w.update()
-            if not w.alive():
-                self.sound_waves.remove(w)
+        # 清理過期聲音波紋（使用 frame-based alive 判定）
+        self.sound_waves = [w for w in self.sound_waves if w.alive(self.frame_count)]
 
         # 敵人視野獎勵（per learning agent）
         for i, agent in enumerate(self.learning_agents):
@@ -709,7 +713,7 @@ class GameEnv:
             g.update()
             if g.should_explode():
                 g.exploded = True
-                self.sound_waves.append(create_explosion_wave(g.x, g.y))
+                self.sound_waves.append(create_explosion_wave(g.x, g.y, self.frame_count))
                 # AOE 傷害
                 for ag in self.all_agents:
                     if not ag.alive():
