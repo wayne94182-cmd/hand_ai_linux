@@ -36,15 +36,15 @@ logger = logging.getLogger(__name__)
 
 # ── 超參數 ──────────────────────────────────────────────
 FRAME_SKIP = 2
-NUM_ENVS = 128
+NUM_ENVS = 64
 GAMMA = 0.990
 GAE_LAMBDA = 0.95
 PPO_EPOCHS = 4
 CLIP_EPS = 0.2
 VALUE_COEF = 0.5
-ENT_START = 0.05
-ENT_END = 0.02
-LR = 1.5e-4
+ENT_START = 0.1
+ENT_END = 0.03
+LR = 3e-4
 MAX_GRAD = 0.5
 TOTAL_EPS = 50000
 ROLLING_WIN_WINDOW = 200

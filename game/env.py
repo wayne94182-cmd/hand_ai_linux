@@ -4,6 +4,7 @@ game/env.py — GameEnv 全面重寫
 武器/道具/手榴彈系統、聲音波紋、NPC 模組化。
 """
 import math
+import math as _math
 import random
 from typing import List, Tuple, Optional
 
@@ -17,7 +18,7 @@ from game.config import (
     NUM_ACTIONS, MAX_FRAMES,
     GameConfig, get_stage_spec,
 )
-from game.maps import MAPS, SMALL_MAPS
+from game.maps import MAPS, SMALL_MAPS, MEDIUM_MAPS, LARGE_MAPS
 from game.fov import (
     _FOV_RC_NP, _FOV_FWD, _FOV_RIGHT, _RAY_FLAT, _RAY_OFFSETS, _RAY_LENGTHS,
     njit_has_line_of_sight, njit_compute_fov,
@@ -47,6 +48,13 @@ _SHOTGUN_OFFSETS = [-30.0, -15.0, 0.0, 15.0, 30.0]
 # 道具生成權重
 _WEAPON_WEIGHTS = [0.3, 0.4, 0.2, 0.1]  # PISTOL, RIFLE, SHOTGUN, SNIPER
 _ITEM_TYPE_WEIGHTS = [0.5, 0.3, 0.2]     # weapon, medkit, grenade
+
+_MAP_POOL = {"small": SMALL_MAPS, "medium": MEDIUM_MAPS, "large": LARGE_MAPS}
+
+def _sample_log_uniform(lo: float, hi: float) -> float:
+    if lo == hi:
+        return lo
+    return _math.exp(random.uniform(_math.log(lo), _math.log(hi)))
 
 
 class GameEnv:
@@ -105,15 +113,22 @@ class GameEnv:
     # ── Reset ──
 
     def reset(self):
-        if self.stage_id == 0 and random.random() < 0.8:
-            self.grid = random.choice(SMALL_MAPS)
-        else:
-            self.grid = random.choice(self.map_pool)
+        # 依 map_pool_key 選擇地圖池 (支援以 '+' 分隔多個地圖池)
+        pool = []
+        keys = self.stage_spec.map_pool_key.split('+')
+        for k in keys:
+            pool.extend(_MAP_POOL.get(k.strip(), SMALL_MAPS))
+        if not pool:
+            pool = SMALL_MAPS
+        self.grid = random.choice(pool)
+        grid_rows, grid_cols = self.grid.shape
+        self.grid_rows = grid_rows
+        self.grid_cols = grid_cols
         self.grid_np = np.array(self.grid, dtype=np.int8)
         empty_spots = [
             (c * TILE_SIZE + TILE_SIZE // 2, r * TILE_SIZE + TILE_SIZE // 2)
-            for r in range(ROWS)
-            for c in range(COLS)
+            for r in range(grid_rows)
+            for c in range(grid_cols)
             if self.grid[r, c] == 0
         ]
 
@@ -156,6 +171,12 @@ class GameEnv:
             a.ammo = PISTOL.mag_size
             a.max_ammo = PISTOL.mag_size
             a.reload_delay = PISTOL.reload_frames
+            # 身體參數 log-uniform 採樣
+            spec = self.stage_spec
+            a.body_speed_mult = _sample_log_uniform(*spec.body_speed_range)
+            a.body_rot_mult   = _sample_log_uniform(*spec.body_rot_range)
+            a.speed = a.base_speed * a.body_speed_mult
+            a.infinite_ammo = spec.infinite_ammo
             idx += 1
             self.learning_agents.append(a)
 
@@ -217,6 +238,24 @@ class GameEnv:
                 else:
                     self.ground_items.append(GroundItem(float(spot[0]), float(spot[1]), "grenade"))
 
+        # 毒圈初始化
+        if self.stage_spec.has_poison_zone:
+            self.poison_cx = (grid_cols * TILE_SIZE) / 2.0
+            self.poison_cy = (grid_rows * TILE_SIZE) / 2.0
+            self.poison_radius_max = _math.hypot(grid_cols * TILE_SIZE, grid_rows * TILE_SIZE) / 2.0
+            self.poison_radius     = self.poison_radius_max
+            self.poison_radius_min = TILE_SIZE * 3.0
+            # 恰好在 max_frames 幀時縮完
+            self.poison_shrink_rate = (
+                (self.poison_radius_max - self.poison_radius_min) /
+                max(1, self.stage_spec.max_frames)
+            )
+            self.poison_dmg_per_frame = 0.15
+        else:
+            self.poison_radius = float('inf')
+            self.poison_shrink_rate = 0.0
+            self.poison_radius_max = float('inf')
+
         # 回傳 states
         states = [self._get_local_view(a) for a in self.learning_agents]
         if self.n_learning_agents == 1:
@@ -237,14 +276,14 @@ class GameEnv:
     def is_wall(self, x, y):
         c = int(x // TILE_SIZE)
         r = int(y // TILE_SIZE)
-        if 0 <= c < COLS and 0 <= r < ROWS:
+        if 0 <= c < self.grid_cols and 0 <= r < self.grid_rows:
             return self.grid[r, c] == 1
         return True
 
     def has_line_of_sight(self, x1, y1, x2, y2):
         return njit_has_line_of_sight(
             float(x1), float(y1), float(x2), float(y2),
-            self.grid_np, float(TILE_SIZE), COLS, ROWS,
+            self.grid_np, float(TILE_SIZE), self.grid_cols, self.grid_rows,
         )
 
     def alive_agents(self):
@@ -327,7 +366,7 @@ class GameEnv:
                 float(fwd_x), float(fwd_y),
                 float(rgt_x), float(rgt_y),
                 self.grid_np,
-                float(TILE_SIZE), COLS, ROWS, VIEW_SIZE,
+                float(TILE_SIZE), self.grid_cols, self.grid_rows, VIEW_SIZE,
             )
         else:
             view[0] = njit_compute_fov_standard(
@@ -335,7 +374,7 @@ class GameEnv:
                 float(fwd_x), float(fwd_y),
                 float(rgt_x), float(rgt_y),
                 self.grid_np,
-                float(TILE_SIZE), COLS, ROWS, VIEW_SIZE,
+                float(TILE_SIZE), self.grid_cols, self.grid_rows, VIEW_SIZE,
             )
 
         # Ch1: 敵人雷達（team_id 不同、在 FOV + LOS）
@@ -412,8 +451,13 @@ class GameEnv:
             view_size=VIEW_SIZE, view_center=VIEW_CENTER, tile_size=TILE_SIZE,
         )
 
-        # Ch5: 安全區（預留介面，目前全 1.0）
-        view[5] = 1.0
+        # Ch5: 安全區（毒圈距離）
+        if self.stage_spec.has_poison_zone and self.poison_radius < float('inf'):
+            dist_self = _math.hypot(ax - self.poison_cx, ay - self.poison_cy)
+            # 1.0=圈心安全, 0.0=剛好在圈邊, 負值=圈外危險
+            view[5] = float(np.clip(1.0 - dist_self / max(1.0, self.poison_radius), -1.0, 1.0))
+        else:
+            view[5] = 1.0
 
         # ── 22 純量 ──
         # weapon one-hot
@@ -451,7 +495,8 @@ class GameEnv:
 
         # 最近隊友
         alive_mates = [m for m in self.all_agents
-                       if m.alive() and m is not agent and m.team_id == agent.team_id]
+                       if not m.truly_dead() and not m.is_downed()
+                       and m is not agent and m.team_id == agent.team_id]
         norm_ft = 0.0
         norm_rt = 0.0
         has_ally = 0.0
@@ -676,7 +721,15 @@ class GameEnv:
                     break
             revived = agent.tick_revive(rescuer_nearby)
             if revived:
-                rewards[i] += 5.0   # REVIVE_REWARD: 被救起的獎勵
+                rewards[i] += 3.0   # 被救者獎勵（降低，避免過大）
+                # 找最近的同隊友給救援獎勵
+                for j, rescuer in enumerate(self.learning_agents):
+                    if j == i or rescuer.truly_dead() or rescuer.is_downed():
+                        continue
+                    if rescuer.team_id == agent.team_id:
+                        if math.hypot(rescuer.x - agent.x, rescuer.y - agent.y) <= TILE_SIZE:
+                            rewards[j] += 5.0   # 救人者獎勵
+                            break
 
         # 清理過期聲音波紋（使用 frame-based alive 判定）
         self.sound_waves = [w for w in self.sound_waves if w.alive(self.frame_count)]
@@ -795,6 +848,30 @@ class GameEnv:
                                     rewards[i] += 10.0  # DOWN_REWARD
                 if g in self.grenades_list:
                     self.grenades_list.remove(g)
+
+        # ── 毒圈更新 ──
+        if self.stage_spec.has_poison_zone:
+            self.poison_radius = max(
+                self.poison_radius_min,
+                self.poison_radius - self.poison_shrink_rate
+            )
+            for i, agent in enumerate(self.learning_agents):
+                if agent.truly_dead() or agent.is_downed():
+                    continue
+                dist = _math.hypot(agent.x - self.poison_cx, agent.y - self.poison_cy)
+                if dist > self.poison_radius:
+                    overdist_ratio = (dist - self.poison_radius) / (TILE_SIZE * 5)
+                    dmg = self.poison_dmg_per_frame * (1.0 + overdist_ratio)
+                    agent.hp -= dmg
+                    rewards[i] -= 0.05 * (1.0 + overdist_ratio)
+
+        # ── 存活時間指數獎勵（僅毒圈階段）──
+        if self.stage_spec.has_poison_zone:
+            progress = self.frame_count / max(1, self.stage_spec.max_frames)
+            survival_bonus = 0.001 * _math.exp(2.0 * progress)
+            for i, agent in enumerate(self.learning_agents):
+                if not agent.truly_dead() and not agent.is_downed():
+                    rewards[i] += survival_bonus
 
         # 存活懲罰
         alive_enemy_cnt = len(self._alive_enemies())
@@ -967,8 +1044,8 @@ class GameEnv:
             return
         self.screen.fill((20, 20, 30))
 
-        for r in range(ROWS):
-            for c in range(COLS):
+        for r in range(self.grid_rows):
+            for c in range(self.grid_cols):
                 if self.grid[r, c] == 1:
                     pygame.draw.rect(self.screen, (100, 100, 120),
                                      (c * TILE_SIZE, r * TILE_SIZE, TILE_SIZE, TILE_SIZE))

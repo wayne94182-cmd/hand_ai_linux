@@ -25,7 +25,7 @@ class GameConfig:
     DASH_PENALTY = -0.2
     REGEN_AMOUNT = 20
 
-    HIT_REWARD = 1.0
+    HIT_REWARD = 2.0
     DAMAGE_PENALTY = 1.0
     WIN_REWARD = 10.0
     LOSE_PENALTY = 5.0
@@ -34,8 +34,8 @@ class GameConfig:
     TIE_PENALTY = 6.0
     COLLISION_PENALTY = 0.005
 
-    aim_reward = 0.00
-    NPC_KILL_REWARD = 10.0
+    aim_reward = 0.02
+    NPC_KILL_REWARD = 15.0
     ALIVE_NPC_PENALTY = 5.0
 
 
@@ -57,27 +57,120 @@ class StageSpec:
     # 動作誤差（比例）：0.05 = ±5%，對移動速度與轉向速度各乘上 uniform(1-pct, 1+pct) 的隨機縮放
     move_noise_pct: float = 0.0      # 移動速度誤差比例，例如 0.05 = ±5%
     rotation_noise_pct: float = 0.0  # 轉向速度誤差比例，例如 0.05 = ±5%
+    infinite_ammo: bool = False          # Stage 0 專用：無限彈匣
+    body_speed_range: tuple = (1.0, 1.0) # log-uniform 身體速度倍率範圍
+    body_rot_range:   tuple = (1.0, 1.0) # log-uniform 轉向速度倍率範圍
+    has_poison_zone:  bool  = False       # 是否啟用毒圈
+    map_pool_key:     str   = "small"    # "small" / "medium" / "large"
+    n_learning_agents: int  = 1          # 本階段的 learning agent 數量
 
 
 STAGE_SPECS = {
-    # 參數順序:
-    # (階段ID, 階段名稱, 模式, 敵人血量, 敵人子彈傷害, AI子彈傷害, 敵人每秒射速, 敵人射擊偏移角度,
-    #  敵人會不會開槍, 敵人會不會移動, 隊友數量, 敵人數量, 最大幀數, 移動速度誤差%, 轉向速度誤差%)
-    # 誤差比例說明：0.05 = ±5%，0.10 = ±10%，0.0 = 無誤差
-    0: StageSpec(0, "基礎期",  "scripted",  100, 20, 50, 0.0, 0.0,  False, False, 0, 3, MAX_FRAMES, move_noise_pct=0.0,  rotation_noise_pct=0.0),
-    # S0: 基礎木樁模式，沒有隊友。讓AI專心尋找敵人與射擊。無動作誤差。
-    1: StageSpec(1, "打靶期",  "scripted",  100, 20, 50, 0.0, 0.0,  False, False, 1, 3, MAX_FRAMES, move_noise_pct=0.0,  rotation_noise_pct=0.0),
-    # S1: 木樁模式。敵人不會開槍也不會移動。無動作誤差。
-    2: StageSpec(2, "追獵期",  "scripted",  100, 20, 35, 0.0, 0.0,  False, True,  1, 3, MAX_FRAMES, move_noise_pct=0.05,  rotation_noise_pct=0.05),
-    # S2: 跑酷模式。敵人會逃跑，不會開槍。無動作誤差。
-    3: StageSpec(3, "生存期",  "scripted",  100, 20, 20, 2.0, 22.5, True,  True,  1, 3, MAX_FRAMES, move_noise_pct=0.05, rotation_noise_pct=0.05),
-    # S3: 砲台模式。敵人開槍。輕微動作誤差 (移動±5%, 轉向±5%)。
-    4: StageSpec(4, "戰術期",  "scripted",  150, 20, 20, 5.0, 22.5, True,  True,  1, 3, MAX_FRAMES, move_noise_pct=0.10, rotation_noise_pct=0.10),
-    # S4: 菁英怪模式。敵人狂射。中等動作誤差 (移動±10%, 轉向±10%)。
-    5: StageSpec(5, "自我博弈", "self_play", 100, 20, 20, 0.0, 0.0,  True,  True,  0, 1, MAX_FRAMES, move_noise_pct=0.10, rotation_noise_pct=0.10),
-    # S5: AI對戰。動作誤差同 S4 (±10%)。
-    6: StageSpec(6, "團隊期",  "team_2v2",  150, 20, 20, 3.0, 65.0, True,  True,  1, 2, MAX_FRAMES, move_noise_pct=0.15, rotation_noise_pct=0.15),
-    # S6: 2v2 模式。最大動作誤差 (移動±15%, 轉向±15%)。
+
+    # Stage 0：瞄準期｜單人、無限彈匣、靜止木樁、小地圖
+    0: StageSpec(
+        stage_id=0, name="瞄準期", mode="scripted",
+        enemy_hp=100, enemy_damage=0, bullet_damage=50,
+        enemy_fire_rate=0.0, enemy_spread_deg=0.0,
+        enemy_can_shoot=False, enemy_mobile=False,
+        teammate_count=0, enemy_count=3,
+        max_frames=900,
+        move_noise_pct=0.02, rotation_noise_pct=0.02,
+        infinite_ammo=True,
+        body_speed_range=(0.95, 1.05), body_rot_range=(0.95, 1.05),
+        has_poison_zone=False, map_pool_key="small",
+        n_learning_agents=1,
+    ),
+
+    # Stage 1：打靶期｜雙人、開局有武器需撿彈匣、木樁、小地圖
+    1: StageSpec(
+        stage_id=1, name="打靶期", mode="scripted",
+        enemy_hp=100, enemy_damage=0, bullet_damage=40,
+        enemy_fire_rate=0.0, enemy_spread_deg=0.0,
+        enemy_can_shoot=False, enemy_mobile=False,
+        teammate_count=1, enemy_count=3,
+        max_frames=1200,
+        move_noise_pct=0.05, rotation_noise_pct=0.05,
+        infinite_ammo=False,
+        body_speed_range=(0.90, 1.10), body_rot_range=(0.90, 1.10),
+        has_poison_zone=False, map_pool_key="small+medium",
+        n_learning_agents=2,
+    ),
+
+    # Stage 2：追獵期｜雙人、逃跑NPC、需預判瞄準、中型地圖
+    2: StageSpec(
+        stage_id=2, name="追獵期", mode="scripted",
+        enemy_hp=100, enemy_damage=0, bullet_damage=30,
+        enemy_fire_rate=0.0, enemy_spread_deg=0.0,
+        enemy_can_shoot=False, enemy_mobile=True,
+        teammate_count=1, enemy_count=3,
+        max_frames=1500,
+        move_noise_pct=0.05, rotation_noise_pct=0.05,
+        infinite_ammo=False,
+        body_speed_range=(0.90, 1.10), body_rot_range=(0.90, 1.10),
+        has_poison_zone=False, map_pool_key="medium",
+        n_learning_agents=2,
+    ),
+
+    # Stage 3：生存期｜雙人、NPC會開槍追擊、學閃避脫戰與治療、中型地圖
+    3: StageSpec(
+        stage_id=3, name="生存期", mode="scripted",
+        enemy_hp=100, enemy_damage=20, bullet_damage=20,
+        enemy_fire_rate=2.0, enemy_spread_deg=22.5,
+        enemy_can_shoot=True, enemy_mobile=True,
+        teammate_count=1, enemy_count=3,
+        max_frames=1500,
+        move_noise_pct=0.08, rotation_noise_pct=0.08,
+        infinite_ammo=False,
+        body_speed_range=(0.85, 1.15), body_rot_range=(0.85, 1.15),
+        has_poison_zone=False, map_pool_key="medium",
+        n_learning_agents=2,
+    ),
+
+    # Stage 4：戰術期｜三人、大地圖、毒圈、強NPC
+    4: StageSpec(
+        stage_id=4, name="戰術期", mode="scripted",
+        enemy_hp=150, enemy_damage=20, bullet_damage=20,
+        enemy_fire_rate=4.0, enemy_spread_deg=20.0,
+        enemy_can_shoot=True, enemy_mobile=True,
+        teammate_count=2, enemy_count=4,
+        max_frames=5400,
+        move_noise_pct=0.10, rotation_noise_pct=0.10,
+        infinite_ammo=False,
+        body_speed_range=(0.85, 1.15), body_rot_range=(0.85, 1.15),
+        has_poison_zone=True, map_pool_key="large+medium",
+        n_learning_agents=3,
+    ),
+
+    # Stage 5：自我博弈｜三人兩隊、大地圖、毒圈
+    5: StageSpec(
+        stage_id=5, name="自我博弈", mode="self_play",
+        enemy_hp=100, enemy_damage=20, bullet_damage=20,
+        enemy_fire_rate=0.0, enemy_spread_deg=0.0,
+        enemy_can_shoot=True, enemy_mobile=True,
+        teammate_count=2, enemy_count=3,
+        max_frames=5400,
+        move_noise_pct=0.12, rotation_noise_pct=0.12,
+        infinite_ammo=False,
+        body_speed_range=(0.80, 1.25), body_rot_range=(0.80, 1.25),
+        has_poison_zone=True, map_pool_key="large",
+        n_learning_agents=3,
+    ),
+
+    # Stage 6：多隊博弈｜三人、30%名人堂舊AI參戰、大地圖、毒圈
+    6: StageSpec(
+        stage_id=6, name="多隊博弈", mode="hall_of_fame",
+        enemy_hp=120, enemy_damage=20, bullet_damage=20,
+        enemy_fire_rate=3.0, enemy_spread_deg=15.0,
+        enemy_can_shoot=True, enemy_mobile=True,
+        teammate_count=2, enemy_count=3,
+        max_frames=5400,
+        move_noise_pct=0.15, rotation_noise_pct=0.15,
+        infinite_ammo=False,
+        body_speed_range=(0.80, 1.25), body_rot_range=(0.80, 1.25),
+        has_poison_zone=True, map_pool_key="large",
+        n_learning_agents=3,
+    ),
 }
 
 

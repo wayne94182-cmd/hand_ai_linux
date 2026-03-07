@@ -40,6 +40,9 @@ class Agent:
 
         self.bot_type = bot_type
         self.speed = 3
+        self.base_speed = 3   # 永久記錄出生速度，供 reset 時乘倍率
+        self.body_speed_mult = 1.0
+        self.body_rot_mult = 1.0
         self.angle = random.randint(0, 359)
         self.hp = 100
         self.max_hp = 100
@@ -80,6 +83,8 @@ class Agent:
         self.revive_progress: int = 0      # 救援累積幀數
         self.revive_frames: int = 300      # 救援所需幀數（5 秒 × 60 FPS）
         self.downed_speed_ratio: float = 0.2  # 倒地時移動速度倍率
+        self.downed_timer: int = 0         # 倒地已經過的幀數
+        self.downed_timeout: int = 600     # 10 秒後若未被救則真正死亡
 
     # ── properties ──
 
@@ -151,7 +156,9 @@ class Agent:
         right_in = (1 if rt > 0.5 else 0) - (1 if lt > 0.5 else 0)
         turn_in = (1 if cw > 0.5 else 0) - (1 if ccw > 0.5 else 0)
 
-        turn_speed = 1.5 if focus > 0.5 else 8.0
+        body_rot_mult = getattr(self, 'body_rot_mult', 1.0)
+        turn_speed = (1.5 if focus > 0.5 else 8.0) * body_rot_mult
+        # 注意：移動速度倍率已在 reset() 時乘入 self.speed，這裡不需再乘
         if self.downed:
             cur_speed = self.speed * self.downed_speed_ratio
         else:
@@ -338,23 +345,29 @@ class Agent:
         self.heal_progress = 0
         self.reload_progress = 0
         self.revive_progress = 0
+        self.downed_timer = 0
 
     def tick_revive(self, rescuer_nearby: bool) -> bool:
         """
         每幀呼叫：有隊友靠近時累積救援進度。
         回傳 True 代表救援完成，Agent 已恢復戰力。
+        超時未被救則真正死亡。
         """
         if not self.downed:
             return False
+        self.downed_timer += 1
+        # 超時未被救 → 真正死亡
+        if self.downed_timer >= self.downed_timeout:
+            self.downed = False
+            self.hp = 0
+            return False
         if rescuer_nearby:
             self.revive_progress += 1
-        else:
-            # 沒有隊友在旁邊時進度不消退（設計選擇：不累退，較寬鬆）
-            pass
         if self.revive_progress >= self.revive_frames:
             self.downed = False
             self.revive_progress = 0
-            self.hp = max(1, int(self.max_hp * 0.2))  # 救起後 20% HP
+            self.downed_timer = 0
+            self.hp = 50  # 救起後恢復半血
             return True
         return False
 
