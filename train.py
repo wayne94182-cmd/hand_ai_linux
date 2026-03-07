@@ -337,7 +337,7 @@ def train(resume_path=None, forced_stage=None, target_stage_eps=50000, n_ai=2):
                  "comm_mu": [], "comm_logstd": [], "masks": []}
                 for _ in range(FLAT_BATCH)]
         episode_done = [False] * NUM_ENVS
-        env_kills = [0] * NUM_ENVS
+        env_downs = [0] * NUM_ENVS
         env_wins = [0] * NUM_ENVS
 
         while not all(episode_done):
@@ -469,7 +469,7 @@ def train(resume_path=None, forced_stage=None, target_stage_eps=50000, n_ai=2):
                         c[:, flat, :] = 0.0
                         last_comm[flat] = 0.0
                         last_masks[flat] = True  # reset masks
-                    env_kills[j] = infos[j].get("kill_count", 0)
+                    env_downs[j] = infos[j].get("down_count", 0)
                     env_wins[j] = 1 if infos[j].get("ai_win", False) else 0
                 else:
                     next_env_states[j] = all_states[j]
@@ -698,8 +698,8 @@ def train(resume_path=None, forced_stage=None, target_stage_eps=50000, n_ai=2):
             avg_rew_per_env.append(env_total / n_ai)
         avg_rew = float(np.mean(avg_rew_per_env))
 
-        for k, w in zip(env_kills, env_wins):
-            rolling_win.append((k, w))
+        for d, w in zip(env_downs, env_wins):
+            rolling_win.append((d, w))
 
         roll_list = list(rolling_win)
         total_ep = len(roll_list)
@@ -710,9 +710,9 @@ def train(resume_path=None, forced_stage=None, target_stage_eps=50000, n_ai=2):
             rolling_win_rate = sum(x[1] for x in roll_list) / total_ep
             if stage_spec.mode == "scripted":
                 max_e = stage_spec.enemy_count
-                kills_only = [x[0] for x in roll_list]
-                dist = [kills_only.count(i) / total_ep for i in range(max_e + 1)]
-                dist_str = " ".join([f"k{i}:{p:.2f}" for i, p in enumerate(dist)])
+                downs_only = [x[0] for x in roll_list]
+                dist = [downs_only.count(i) / total_ep for i in range(max_e + 1)]
+                dist_str = " ".join([f"d{i}:{p:.2f}" for i, p in enumerate(dist)])
 
         show_stats = current_stage <= 6
 
@@ -729,7 +729,7 @@ def train(resume_path=None, forced_stage=None, target_stage_eps=50000, n_ai=2):
         if show_stats:
             postfix["win"] = f"{rolling_win_rate:.3f}"
             if dist_str:
-                postfix["kills"] = dist_str
+                postfix["downs"] = dist_str
         pbar.set_postfix(postfix)
 
         msg = (
@@ -739,7 +739,7 @@ def train(resume_path=None, forced_stage=None, target_stage_eps=50000, n_ai=2):
         if show_stats:
             msg += f", win_rate={rolling_win_rate:.3f}"
             if dist_str:
-                msg += f", kills=[{dist_str}]"
+                msg += f", downs=[{dist_str}]"
         msg += f" | batch={batch_time:.1f}s, elapsed={format_time(elapsed)}, ETA={format_time(eta_sec)}"
         logger.info(msg)
 
