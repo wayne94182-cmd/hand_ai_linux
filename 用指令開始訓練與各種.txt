@@ -1,0 +1,8 @@
+source venv/bin/activate
+1.	訓練（指定階段與總輪數）: python3 train.py --stage 0 --stage_eps 30000
+2.	訓練（指定階段）: python3 train.py --stage 2
+3.	從存檔續訓並指定階段: python3 train.py --resume snn_S1_ep_20000.pth --stage 1 --stage_eps 50000
+4.	跨stage與局數、商重置：python3 train.py --resume snn_S0_ep_30000.pth --stage 1 --stage_eps 80000
+5.	手動存檔並中止: touch STOP_AND_SAVE
+6.	觀戰（指定存檔+階段）: python watch.py --ckpt snn_S0_ep_70000.pth --stage 5 --ai_view
+pkill -f train.py

@@ -1,7 +1,14 @@
 """
 watch.py — 觀戰腳本（支援多 AI + 通訊向量顯示）
+相容重構後的介面：
+  - env 回傳 (view, scalars, team_id) 三元組
+  - LSTM hidden = (h, c) tuple
+  - model.forward → (logits, comm_mu, comm_logstd, feat, new_hidden)
+  - 動作維度 = 12（Bernoulli 離散）
+  - comm 維度 = 4
 """
 import argparse
+import math
 import os
 import time
 
@@ -9,11 +16,13 @@ import numpy as np
 import pygame
 import torch
 from dataclasses import replace
+from torch.distributions import Bernoulli, Normal
 
-from ai import ConvLSTM, HIDDEN_SIZE, NUM_COMM
+from ai import ConvLSTM, HIDDEN_SIZE, NUM_COMM, NUM_ACTIONS_DISCRETE
 from game import (
     GameEnv, get_stage_spec,
     WIDTH, HEIGHT, FPS, ROWS, COLS, TILE_SIZE,
+    VIEW_RANGE, HALF_FOV, FOV_DEGREES,
 )
 from game.env import NUM_CHANNELS, NUM_SCALARS
 
@@ -97,7 +106,7 @@ def parse_model_path(ckpt: str) -> str:
 
 
 def load_model(model_path: str, device):
-    payload = torch.load(model_path, map_location=device)
+    payload = torch.load(model_path, map_location=device, weights_only=False)
     model = ConvLSTM().to(device)
     if isinstance(payload, dict) and "model_state" in payload:
         model.load_state_dict(payload["model_state"])
@@ -179,6 +188,17 @@ def draw_comm_panel(screen, comm_vecs, x0, y0, font_sm):
         y0 += 8
 
 
+def _unpack_state(state_tuple):
+    """
+    解包 env 回傳的 state，相容新舊格式：
+      新格式 (view, scalars, team_id) → return view, scalars, team_id
+      舊格式 (view, scalars)          → return view, scalars, 0
+    """
+    if len(state_tuple) == 3:
+        return state_tuple[0], state_tuple[1], int(state_tuple[2])
+    return state_tuple[0], state_tuple[1], 0
+
+
 def watch_ai(ckpt: str, stage_id: int,
              max_frames: int = 1200,
              show_ai_view: bool = False,
@@ -195,7 +215,7 @@ def watch_ai(ckpt: str, stage_id: int,
 
     print(f"載入模型  : {model_path} (n_ai={n_ai})")
     print(f"觀戰階段  : Stage {stage_id} - {stage_spec.name}")
-    print("操作說明  : [Space] 暫停  [] 加速  [] 減速  [Esc] 離開")
+    print("操作說明  : [Space] 暫停  []] 加速  [[] 減速  [Esc] 離開")
 
     ch_px = 15 * CELL
     panel_w = 2 * (ch_px + PAD) + PAD if show_ai_view else 0
@@ -218,23 +238,30 @@ def watch_ai(ckpt: str, stage_id: int,
     env.font = font
     env.stage_spec = replace(env.stage_spec, max_frames=max_frames)
 
+    # ── Reset 並解包 state ──
     result = env.reset()
     if n_ai == 1:
-        states = [result]
+        states = [result]          # result = (view, scalars, team_id)
     else:
-        states = result
+        states = result            # result = [(view, scalars, tid), ...]
 
-    # LSTM hidden per agent
-    h_list = [torch.zeros(1, 1, HIDDEN_SIZE, device=device) for _ in range(n_ai)]
-    c_list = [torch.zeros(1, 1, HIDDEN_SIZE, device=device) for _ in range(n_ai)]
+    # ── LSTM hidden per agent: (h, c) 各 (1, 1, HIDDEN_SIZE) ──
+    hiddens = [
+        (torch.zeros(1, 1, HIDDEN_SIZE, device=device),
+         torch.zeros(1, 1, HIDDEN_SIZE, device=device))
+        for _ in range(n_ai)
+    ]
+
+    # 通訊向量（上一步輸出，供下一步做 comm_in）
     comm_vecs = [np.zeros(NUM_COMM, dtype=np.float32) for _ in range(n_ai)]
 
     done = False
     step = 0
-    actions = [[0.0] * 12 for _ in range(n_ai)]
+    actions = [[0.0] * NUM_ACTIONS_DISCRETE for _ in range(n_ai)]
     paused = False
     speed_idx = DEFAULT_SPEED_IDX
-    last_view_np = states[0][0].copy() if states else np.zeros((NUM_CHANNELS, 15, 15))
+    v0, s0, _ = _unpack_state(states[0])
+    last_view_np = v0.copy()
     last_reward = 0.0
     last_info: dict = {}
 
@@ -251,6 +278,23 @@ def watch_ai(ckpt: str, stage_id: int,
                     pygame.draw.rect(screen, (100, 100, 120),
                                      (c * TILE_SIZE, r * TILE_SIZE,
                                       TILE_SIZE, TILE_SIZE))
+
+        # 地面道具
+        for gi in env.ground_items:
+            if gi.item_type == "weapon":
+                color = (180, 180, 60)
+            elif gi.item_type == "medkit":
+                color = (60, 220, 60)
+            else:
+                color = (220, 60, 60)
+            pygame.draw.circle(screen, color, (int(gi.x), int(gi.y)), 4)
+
+        # 手榴彈
+        for g in env.grenades_list:
+            if not g.exploded:
+                pygame.draw.circle(screen, (255, 140, 0),
+                                   (int(g.x), int(g.y)), 4)
+
         for p in env.projectiles:
             p.draw(screen)
         for a in env.all_agents:
@@ -350,33 +394,63 @@ def watch_ai(ckpt: str, stage_id: int,
                 if step % FRAME_SKIP == 0:
                     new_actions = []
                     for i in range(n_ai):
+                        view_i, sc_i, tid_i = _unpack_state(states[i])
+
                         with torch.no_grad():
-                            s0 = torch.tensor(
-                                states[i][0], dtype=torch.float32
+                            # 視覺 tensor: (1, 6, 15, 15)
+                            s0_t = torch.tensor(
+                                view_i, dtype=torch.float32
                             ).unsqueeze(0).to(device)
-                            s1 = torch.tensor(
-                                states[i][1], dtype=torch.float32
+                            # 純量 tensor: (1, 22)
+                            s1_t = torch.tensor(
+                                sc_i, dtype=torch.float32
                             ).unsqueeze(0).to(device)
-                            logits, mu, logstd, _, (h_new, c_new) = model(
-                                s0, s1, (h_list[i], c_list[i]))
+
+                            # comm_in: 收集同隊其他 agent 上一步的 comm 輸出
+                            mate_comms = []
+                            for j in range(n_ai):
+                                if j == i:
+                                    continue
+                                _, _, tid_j = _unpack_state(states[j])
+                                if tid_j == tid_i:
+                                    mate_comms.append(comm_vecs[j])
+                            if mate_comms:
+                                comm_in_t = torch.tensor(
+                                    np.array(mate_comms), dtype=torch.float32
+                                ).unsqueeze(0).to(device)  # (1, K, 4)
+                            else:
+                                comm_in_t = None
+
+                            # 前向傳播
+                            logits, mu, logstd, _, new_hidden = model(
+                                s0_t, s1_t, hiddens[i], comm_in_t)
+
+                            # 離散動作: Bernoulli 取樣
                             probs = torch.sigmoid(logits[0])
                             act = (probs > 0.5).float().cpu().tolist()
+
+                            # 更新通訊向量
                             comm_vecs[i] = mu[0].cpu().numpy()
-                            h_list[i] = h_new
-                            c_list[i] = c_new
+
+                            # 更新 hidden state
+                            hiddens[i] = new_hidden
+
                         new_actions.append(act)
 
                     actions = new_actions
-                    last_view_np = states[0][0].copy()
+                    v0, _, _ = _unpack_state(states[0])
+                    last_view_np = v0.copy()
 
+                # env.step — 回傳格式依 n_ai 自動切換
                 result = env.step(actions, frame_skip=1)
                 if n_ai == 1:
                     state_out, last_reward, done, last_info = result
-                    states = [state_out]
+                    states = [state_out]   # state_out = (view, scalars, team_id)
                 else:
                     states_out, rewards_out, done, last_info = result
-                    states = states_out
-                    last_reward = sum(rewards_out) / len(rewards_out) if rewards_out else 0.0
+                    states = states_out    # list of (view, scalars, team_id)
+                    last_reward = (sum(rewards_out) / len(rewards_out)
+                                   if rewards_out else 0.0)
                 step += 1
 
         draw_frame()
@@ -410,8 +484,6 @@ def _draw_fov_color(screen, agent, color, show_fov):
     """繪製指定顏色的 FOV 扇形"""
     if not show_fov:
         return
-    import math
-    from game.config import FOV_DEGREES, HALF_FOV, VIEW_RANGE
     rad = math.radians(agent.angle)
     fwd_x, fwd_y = math.cos(rad), math.sin(rad)
     rgt_x, rgt_y = math.cos(rad + math.pi / 2), math.sin(rad + math.pi / 2)
