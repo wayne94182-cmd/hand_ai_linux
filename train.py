@@ -53,8 +53,6 @@ STOP_SIGNAL_FILE = "STOP_AND_SAVE"
 
 # 新增超參數
 COMM_ENT_COEF = 0.01
-INDIVIDUAL_REWARD_WEIGHT = 0.6
-TEAM_REWARD_WEIGHT = 0.4
 
 MANUAL_STOP = False
 
@@ -198,11 +196,16 @@ class VecEnv:
 #  Checkpoint
 # ═══════════════════════════════════════════════════════
 
+def _unwrap(m):
+    """取出 torch.compile wrapper 內的原始模型"""
+    return getattr(m, "_orig_mod", m)
+
+
 def save_checkpoint(path, model, critic, optimizer, optimizer_critic,
                     total_eps_done, stage_id, n_ai):
     payload = {
-        "model_state": model.state_dict(),
-        "critic_state": critic.state_dict(),
+        "model_state": _unwrap(model).state_dict(),
+        "critic_state": _unwrap(critic).state_dict(),
         "optimizer_state": optimizer.state_dict(),
         "optimizer_critic_state": optimizer_critic.state_dict(),
         "total_eps_done": total_eps_done,
@@ -250,6 +253,12 @@ def train(resume_path=None, forced_stage=None, target_stage_eps=50000, n_ai=2):
     optimizer_critic = optim.Adam(critic.parameters(), lr=LR)
     use_amp = device.type == "cuda"
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+
+    # torch.compile 加速（僅 CUDA）
+    torch.backends.cudnn.benchmark = False  # max_t 動態變化，不開 benchmark
+    if device.type == "cuda":
+        model  = torch.compile(model,  dynamic=True)
+        critic = torch.compile(critic, dynamic=True)
 
     total_eps_done = 0
     save_milestone = SAVE_EVERY
@@ -524,18 +533,33 @@ def train(resume_path=None, forced_stage=None, target_stage_eps=50000, n_ai=2):
             if traj[f]["masks"]:
                 bat_masks[:t_i, f] = torch.stack(traj[f]["masks"])
 
-        bat_states = bat_states.to(device)
-        bat_scalars = bat_scalars.to(device)
-        bat_actions = bat_actions.to(device)
-        bat_old_lp = bat_old_lp.to(device)
-        bat_adv = bat_adv.to(device)
-        bat_ret = bat_ret.to(device)
-        bat_comm_acts = bat_comm_acts.to(device)
-        bat_comm_lp = bat_comm_lp.to(device)
-        bat_comm_mu = bat_comm_mu.to(device)
-        bat_comm_logstd = bat_comm_logstd.to(device)
-        bat_masks = bat_masks.to(device)
-        mask = mask.to(device)
+        # pin_memory + non_blocking 加速 CPU→GPU 傳輸
+        if device.type == "cuda":
+            bat_states      = bat_states.pin_memory()
+            bat_scalars     = bat_scalars.pin_memory()
+            bat_actions     = bat_actions.pin_memory()
+            bat_old_lp      = bat_old_lp.pin_memory()
+            bat_adv         = bat_adv.pin_memory()
+            bat_ret         = bat_ret.pin_memory()
+            bat_comm_acts   = bat_comm_acts.pin_memory()
+            bat_comm_lp     = bat_comm_lp.pin_memory()
+            bat_comm_mu     = bat_comm_mu.pin_memory()
+            bat_comm_logstd = bat_comm_logstd.pin_memory()
+            bat_masks       = bat_masks.pin_memory()
+            mask            = mask.pin_memory()
+
+        bat_states      = bat_states.to(device, non_blocking=True)
+        bat_scalars     = bat_scalars.to(device, non_blocking=True)
+        bat_actions     = bat_actions.to(device, non_blocking=True)
+        bat_old_lp      = bat_old_lp.to(device, non_blocking=True)
+        bat_adv         = bat_adv.to(device, non_blocking=True)
+        bat_ret         = bat_ret.to(device, non_blocking=True)
+        bat_comm_acts   = bat_comm_acts.to(device, non_blocking=True)
+        bat_comm_lp     = bat_comm_lp.to(device, non_blocking=True)
+        bat_comm_mu     = bat_comm_mu.to(device, non_blocking=True)
+        bat_comm_logstd = bat_comm_logstd.to(device, non_blocking=True)
+        bat_masks       = bat_masks.to(device, non_blocking=True)
+        mask            = mask.to(device, non_blocking=True)
 
         # Fix 7: 預計算每個 flat index 的 team_id（用最後一次觀測到的 team）
         flat_team_ids = np.zeros(FLAT_BATCH, dtype=np.int32)
@@ -544,119 +568,120 @@ def train(resume_path=None, forced_stage=None, target_stage_eps=50000, n_ai=2):
                 flat = i * NUM_ENVS + j
                 flat_team_ids[flat] = int(env_states[j][i][2]) if env_states[j][i] is not None else 0
 
-        # ── PPO 更新 ──
+        # ── PPO 更新（seq_mode 向量化）──
         model.train()
         critic.train()
+
+        # 預計算 team mask tensor（避免 PPO epoch 內重複建立）
+        team0_mask_t = torch.tensor([flat_team_ids[f] == 0 for f in range(FLAT_BATCH)],
+                                     dtype=torch.bool, device=device)
+        team1_mask_t = torch.tensor([flat_team_ids[f] == 1 for f in range(FLAT_BATCH)],
+                                     dtype=torch.bool, device=device)
+
         for _ in range(PPO_EPOCHS):
             optimizer.zero_grad()
             optimizer_critic.zero_grad()
+
             h_tr = torch.zeros(1, FLAT_BATCH, HIDDEN_SIZE, device=device)
             c_tr = torch.zeros(1, FLAT_BATCH, HIDDEN_SIZE, device=device)
-            ep_actor_losses = []
-            ep_critic_losses = []
 
-            for t in range(max_t):
-                s = bat_states[t]
-                sc = bat_scalars[t]
-                a = bat_actions[t]
-                lp_old = bat_old_lp[t]
-                adv = bat_adv[t]
-                ret = bat_ret[t]
-                m_t = mask[t]
-                old_ca = bat_comm_acts[t]
-                old_clp = bat_comm_lp[t]
-                m_act = bat_masks[t]   # (FLAT_BATCH, 12) action masks
+            # 一次 forward 取代整個 for t 迴圈
+            with torch.amp.autocast("cuda", enabled=use_amp):
+                logits_all, mu_all, logstd_all, feat_all, _ = model(
+                    bat_states, bat_scalars, (h_tr, c_tr),
+                    comm_in=None,
+                    seq_mode=True
+                )
+            # logits_all: (max_t, FLAT_BATCH, 12)
+            # feat_all:   (max_t, FLAT_BATCH, 256)
 
-                if not m_t.any():
-                    with torch.no_grad():
-                        _, _, _, _, (h_tr, c_tr) = model(s, sc, (h_tr, c_tr))
-                    h_tr = h_tr.detach()
-                    c_tr = c_tr.detach()
-                    continue
+            logits_all = logits_all.float()
+            feat_all   = feat_all.float()
 
-                with torch.amp.autocast("cuda", enabled=use_amp):
-                    logits, new_mu, new_logstd, feat, (h_tr, c_tr) = model(
-                        s, sc, (h_tr, c_tr))
+            # 展平所有時間步 → (max_t * FLAT_BATCH, ...)
+            TB = max_t * FLAT_BATCH
+            valid_flat = mask.reshape(TB)                             # (TB,)
+            n_valid = valid_flat.float().sum().clamp(min=1)
 
-                logits = logits.float()
-                feat = feat.float()
+            logits_flat = logits_all.reshape(TB, 12)
+            mu_flat     = mu_all.reshape(TB, NUM_COMM)
+            logstd_flat = logstd_all.reshape(TB, NUM_COMM)
+            feat_flat   = feat_all.reshape(TB, HIDDEN_SIZE)
 
-                # Fix 2D: Action Masking 在 PPO update 時
-                logits_masked = logits.masked_fill(~m_act, -1e9)
-                probs = torch.sigmoid(logits_masked)
-                dist_d = Bernoulli(probs)
-                new_lp = dist_d.log_prob(a).sum(dim=1)
-                entropy_d = dist_d.entropy().sum(dim=1)
+            a_flat      = bat_actions.reshape(TB, 12)
+            lp_old_flat = bat_old_lp.reshape(TB)
+            adv_flat    = bat_adv.reshape(TB)
+            ret_flat    = bat_ret.reshape(TB)
+            ca_flat     = bat_comm_acts.reshape(TB, NUM_COMM)
+            clp_flat    = bat_comm_lp.reshape(TB)
+            m_act_flat  = bat_masks.reshape(TB, 12)
 
-                ratio = torch.exp(new_lp - lp_old)
-                surr1 = ratio * adv
-                surr2 = torch.clamp(ratio, 1 - CLIP_EPS, 1 + CLIP_EPS) * adv
-                actor_loss = -torch.min(surr1, surr2)
+            # Action Masking
+            logits_masked = logits_flat.masked_fill(~m_act_flat, -1e9)
+            probs = torch.sigmoid(logits_masked)
+            dist_d = Bernoulli(probs)
+            new_lp = dist_d.log_prob(a_flat).sum(dim=1)         # (TB,)
+            entropy_d = dist_d.entropy().sum(dim=1)             # (TB,)
 
-                # 通訊損失
-                new_std = torch.exp(new_logstd)
-                new_comm_lp = CommHandler.old_log_prob(new_mu, new_logstd, old_ca)
-                ratio_c = torch.exp(new_comm_lp - old_clp)
-                surr1_c = ratio_c * adv
-                surr2_c = torch.clamp(ratio_c, 1 - CLIP_EPS, 1 + CLIP_EPS) * adv
-                comm_loss = -torch.min(surr1_c, surr2_c)
-                comm_entropy = Normal(new_mu, new_std + 1e-8).entropy().sum(dim=1)
+            ratio = torch.exp(new_lp - lp_old_flat)
+            surr1 = ratio * adv_flat
+            surr2 = torch.clamp(ratio, 1 - CLIP_EPS, 1 + CLIP_EPS) * adv_flat
+            actor_loss = -torch.min(surr1, surr2)
 
-                total_actor = (actor_loss + comm_loss
-                               - entropy_coef * entropy_d
-                               - COMM_ENT_COEF * comm_entropy)
+            # 通訊損失
+            new_std = torch.exp(logstd_flat)
+            new_comm_lp = CommHandler.old_log_prob(mu_flat, logstd_flat, ca_flat)
+            ratio_c = torch.exp(new_comm_lp - clp_flat)
+            surr1_c = ratio_c * adv_flat
+            surr2_c = torch.clamp(ratio_c, 1 - CLIP_EPS, 1 + CLIP_EPS) * adv_flat
+            comm_loss = -torch.min(surr1_c, surr2_c)
+            comm_entropy = Normal(mu_flat, new_std + 1e-8).entropy().sum(dim=1)
 
-                valid = m_t.float()
-                n_valid = valid.sum().clamp(min=1)
-                t_actor = (total_actor * valid).sum() / n_valid
-                ep_actor_losses.append(t_actor)
+            total_actor = (actor_loss + comm_loss
+                           - entropy_coef * entropy_d
+                           - COMM_ENT_COEF * comm_entropy)
 
-                # Fix 1+7: Critic 使用 feat.detach()，按 team_id 分組
-                feat_d = feat.detach()
-                # 簡化分組：收集 team 0 和 team 1 的 feat
-                team0_idx = [f for f in range(FLAT_BATCH) if m_t[f] and flat_team_ids[f] == 0]
-                team1_idx = [f for f in range(FLAT_BATCH) if m_t[f] and flat_team_ids[f] == 1]
+            t_actor_loss = (total_actor * valid_flat.float()).sum() / n_valid
 
-                if team0_idx:
-                    t0_feat = feat_d[team0_idx]  # (N0, 256)
-                else:
-                    t0_feat = torch.zeros(1, HIDDEN_SIZE, device=device)
-                if team1_idx:
-                    t1_feat = feat_d[team1_idx]  # (N1, 256)
-                else:
-                    t1_feat = None
+            # Critic（需按 team 分組）
+            feat_d = feat_flat.detach()   # (TB, 256)
 
-                # 計算 value — 所有 valid agent 共享同一個 critic output
-                # 但每個 agent 各自用自己 team 的 pool
-                v_pred_all = torch.zeros(FLAT_BATCH, device=device)
-                if team0_idx:
-                    v0 = critic(t0_feat, t1_feat)
-                    for idx_i, fi in enumerate(team0_idx):
-                        v_pred_all[fi] = v0[idx_i]
-                if team1_idx:
-                    # team1 的 critic：team1 在左，team0 在右
-                    v1 = critic(t1_feat, t0_feat if team0_idx else None)
-                    for idx_i, fi in enumerate(team1_idx):
-                        v_pred_all[fi] = v1[idx_i]
+            # 展平 team mask: (max_t, FLAT_BATCH) → (TB,)
+            # 每個時間步的 team 分配都一樣，所以直接 expand
+            team0_exp = team0_mask_t.unsqueeze(0).expand(max_t, -1).reshape(TB)
+            team1_exp = team1_mask_t.unsqueeze(0).expand(max_t, -1).reshape(TB)
 
-                critic_l = (v_pred_all - ret).pow(2)
-                t_critic = (critic_l * valid).sum() / n_valid
-                ep_critic_losses.append(t_critic)
+            # valid + team
+            v0_idx = valid_flat & team0_exp
+            v1_idx = valid_flat & team1_exp
+
+            v_pred_flat = torch.zeros(TB, device=device)
+
+            if v0_idx.any():
+                t0_feat = feat_d[v0_idx]
+                t1_feat = feat_d[v1_idx] if v1_idx.any() else None
+                v0 = critic(t0_feat, t1_feat)
+                v_pred_flat[v0_idx] = v0
+
+            if v1_idx.any():
+                t1_feat = feat_d[v1_idx]
+                t0_feat = feat_d[v0_idx] if v0_idx.any() else None
+                v1 = critic(t1_feat, t0_feat)
+                v_pred_flat[v1_idx] = v1
+
+            critic_l = (v_pred_flat - ret_flat).pow(2)
+            t_critic_loss = (critic_l * valid_flat.float()).sum() / n_valid
 
             # Actor backward
-            if ep_actor_losses:
-                total_actor_loss = torch.stack(ep_actor_losses).mean()
-                scaler.scale(total_actor_loss).backward()
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), MAX_GRAD)
-                scaler.step(optimizer)
+            scaler.scale(t_actor_loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(_unwrap(model).parameters(), MAX_GRAD)
+            scaler.step(optimizer)
 
             # Critic backward
-            if ep_critic_losses:
-                total_critic_loss = torch.stack(ep_critic_losses).mean() * VALUE_COEF
-                total_critic_loss.backward()
-                torch.nn.utils.clip_grad_norm_(critic.parameters(), MAX_GRAD)
-                optimizer_critic.step()
+            (t_critic_loss * VALUE_COEF).backward()
+            torch.nn.utils.clip_grad_norm_(_unwrap(critic).parameters(), MAX_GRAD)
+            optimizer_critic.step()
 
             scaler.update()
 

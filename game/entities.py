@@ -39,13 +39,13 @@ class Agent:
                 self.team_id = -1
 
         self.bot_type = bot_type
-        self.speed = 3
-        self.base_speed = 3   # 永久記錄出生速度，供 reset 時乘倍率
+        self.speed = GameConfig.AGENT_BASE_SPEED
+        self.base_speed = GameConfig.AGENT_BASE_SPEED   # 永久記錄出生速度，供 reset 時乘倍率
         self.body_speed_mult = 1.0
         self.body_rot_mult = 1.0
         self.angle = random.randint(0, 359)
-        self.hp = 100
-        self.max_hp = 100
+        self.hp = GameConfig.AGENT_MAX_HP
+        self.max_hp = GameConfig.AGENT_MAX_HP
         self.attack_cooldown = 0
         self.ammo = 5
         self.max_ammo = 5

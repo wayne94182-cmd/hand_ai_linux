@@ -3,6 +3,7 @@ ai/actor.py — CNN + LSTM Actor
 支援 6 通道視覺輸入、22 純量、LSTM 雙狀態、
 12 離散 Bernoulli 動作、4 維連續通訊向量（Normal）、
 Cross-Attention 隊友通訊接收。
+支援 seq_mode=True 時一次處理整條時間序列（供 PPO 更新使用）。
 """
 import torch
 import torch.nn as nn
@@ -24,6 +25,7 @@ class ConvLSTM(nn.Module):
     3. 12 個離散動作（Bernoulli）
     4. 4 維連續通訊向量（Normal distribution）
     5. Cross-Attention 接收隊友通訊
+    6. seq_mode=True 一次處理整條時間序列
     """
 
     def __init__(self,
@@ -64,7 +66,7 @@ class ConvLSTM(nn.Module):
         self.fuse_norm = nn.LayerNorm(hidden_size)
 
         # ── LSTM ──
-        self.lstm = nn.LSTM(hidden_size, hidden_size, batch_first=True)
+        self.lstm = nn.LSTM(hidden_size, hidden_size, batch_first=False)
         self.lstm_norm = nn.LayerNorm(hidden_size)
 
         # ── 輸出頭 ──
@@ -72,20 +74,72 @@ class ConvLSTM(nn.Module):
         self.fc_comm_mu     = nn.Linear(hidden_size, num_comm) # 通訊 μ
         self.fc_comm_logstd = nn.Linear(hidden_size, num_comm) # 通訊 log σ
 
-    def forward(self, x, scalars, hidden=None, comm_in=None):
+    def _cnn_embed(self, x, scalars):
+        """CNN + fc_embed，支援任意 batch 維度的輸入。
+        x:       (N, C, H, W)
+        scalars: (N, num_scalars)
+        回傳:    (N, hidden_size)
         """
-        x       : (B, 6, 15, 15)
-        scalars : (B, 22)
-        hidden  : tuple (h, c) 各 (1, B, 256)，或 None
-        comm_in : (B, K, 4) 隊友通訊向量，K=0 時傳 None 或空 tensor
+        c1   = F.relu(self.bn1(self.conv1(x)))
+        c2   = F.relu(self.bn2(self.conv2(c1)))
+        c3   = F.relu(self.bn3(self.conv3(c2)))
+        flat = c3.view(x.size(0), -1)
+        embed = F.relu(self.embed_norm(
+            self.fc_embed(torch.cat([flat, scalars], dim=-1))
+        ))
+        return embed
 
-        回傳:
-          logits     : (B, 12)   離散動作 logits
-          comm_mu    : (B, 4)    通訊分佈期望值（tanh 壓縮到 [-1,1]）
-          comm_logstd: (B, 4)    log σ，clamp 到 [-4, 0]
-          value_feat : (B, 256)  LSTM 輸出特徵（供 Critic 使用）
-          new_hidden : (h, c) 各 (1, B, 256)
+    def _cross_attention(self, prev_h, comm_in):
+        """Cross-Attention 通訊接收。
+        prev_h:   (N, hidden_size)
+        comm_in:  (N, K, num_comm)  K >= 1（K=0 時由呼叫方補 dummy）
+        回傳:     (N, hidden_size)，若原始 K=0 則結果為零
         """
+        Q  = self.attn_q(prev_h).unsqueeze(1)       # (N, 1, H)
+        KV = self.comm_proj(comm_in)                 # (N, K, H)
+        K_ = self.attn_k(KV)
+        V_ = self.attn_v(KV)
+        scale = self.hidden_size ** 0.5
+        attn_w = torch.softmax(
+            torch.bmm(Q, K_.transpose(1, 2)) / scale, dim=-1
+        )                                             # (N, 1, K)
+        ctx = torch.bmm(attn_w, V_).squeeze(1)       # (N, H)
+        ctx = self.attn_out(ctx)
+        return ctx
+
+    def forward(self, x, scalars, hidden=None, comm_in=None, seq_mode=False):
+        """
+        seq_mode=False（預設，供 rollout 使用）:
+          x:       (B, C, H, W)
+          scalars: (B, num_scalars)
+          comm_in: (B, K, num_comm) 或 None
+          hidden:  (h, c) 各 (1, B, hidden_size) 或 None
+          回傳:
+            logits:      (B, 12)
+            comm_mu:     (B, 4)
+            comm_logstd: (B, 4)
+            feat:        (B, 256)
+            new_hidden:  (h, c) 各 (1, B, 256)
+
+        seq_mode=True（供 PPO 更新使用）:
+          x:       (T, B, C, H, W)
+          scalars: (T, B, num_scalars)
+          comm_in: (T, B, K, num_comm) 或 None
+          hidden:  (h, c) 各 (1, B, hidden_size) 或 None
+          回傳:
+            logits:      (T, B, 12)
+            comm_mu:     (T, B, 4)
+            comm_logstd: (T, B, 4)
+            feat:        (T, B, 256)
+            new_hidden:  (h, c) 各 (1, B, 256)
+        """
+        if seq_mode:
+            return self._forward_seq(x, scalars, hidden, comm_in)
+        else:
+            return self._forward_single(x, scalars, hidden, comm_in)
+
+    def _forward_single(self, x, scalars, hidden, comm_in):
+        """原始單步 forward，行為與重構前完全一致。"""
         B = x.size(0)
         if hidden is None:
             h0 = torch.zeros(1, B, self.hidden_size, device=x.device, dtype=x.dtype)
@@ -93,45 +147,82 @@ class ConvLSTM(nn.Module):
             hidden = (h0, c0)
 
         # CNN
-        c1   = F.relu(self.bn1(self.conv1(x)))
-        c2   = F.relu(self.bn2(self.conv2(c1)))
-        c3   = F.relu(self.bn3(self.conv3(c2)))
-        flat = c3.view(B, -1)
-        embed = F.relu(self.embed_norm(
-            self.fc_embed(torch.cat([flat, scalars], dim=-1))
-        ))  # (B, 256)
+        embed = self._cnn_embed(x, scalars)  # (B, 256)
 
-        # Cross-Attention
-        if comm_in is not None and comm_in.dim() == 3 and comm_in.size(1) > 0:
-            # Query 來自上一步的 h
-            prev_h = hidden[0].squeeze(0)                          # (B, 256)
-            Q = self.attn_q(prev_h).unsqueeze(1)                   # (B, 1, 256)
-            KV = self.comm_proj(comm_in)                           # (B, K, 256)
-            K = self.attn_k(KV)
-            V = self.attn_v(KV)
-            scale = self.hidden_size ** 0.5
-            attn_w = torch.softmax(
-                torch.bmm(Q, K.transpose(1, 2)) / scale, dim=-1
-            )                                                      # (B, 1, K)
-            ctx = torch.bmm(attn_w, V).squeeze(1)                 # (B, 256)
-            ctx = self.attn_out(ctx)
+        # Cross-Attention（compile 友好：避免 if/else graph break）
+        prev_h = hidden[0].squeeze(0)     # (B, 256)
+        if comm_in is None or comm_in.dim() != 3 or comm_in.size(1) == 0:
+            # 補 dummy，計算後用 mask 清零（tracing 時只走一次）
+            _comm = torch.zeros(B, 1, self.num_comm, device=x.device, dtype=x.dtype)
+            _has_comm = 0.0
         else:
-            ctx = torch.zeros(B, self.hidden_size, device=x.device, dtype=x.dtype)
+            _comm = comm_in
+            _has_comm = 1.0
+        ctx = self._cross_attention(prev_h, _comm)
+        ctx = ctx * _has_comm
 
         # 融合 embed + context
         fused = F.relu(self.fuse_norm(
             self.fc_fuse(torch.cat([embed, ctx], dim=-1))
         ))  # (B, 256)
 
-        # LSTM
-        lstm_in = fused.unsqueeze(1)                             # (B, 1, 256)
+        # LSTM（單步，batch_first=False → 輸入 (1, B, H)）
+        lstm_in = fused.unsqueeze(0)                              # (1, B, 256)
         lstm_out, new_hidden = self.lstm(lstm_in, hidden)
-        feat = self.lstm_norm(lstm_out.squeeze(1))               # (B, 256)
+        feat = self.lstm_norm(lstm_out.squeeze(0))                # (B, 256)
 
         # 輸出
-        logits      = self.fc_actor(feat)                        # (B, 12)
-        comm_mu     = torch.tanh(self.fc_comm_mu(feat))          # (B, 4)，[-1,1]
+        logits      = self.fc_actor(feat)                         # (B, 12)
+        comm_mu     = torch.tanh(self.fc_comm_mu(feat))           # (B, 4)
         comm_logstd = self.fc_comm_logstd(feat).clamp(-4, 0)     # (B, 4)
+
+        return logits, comm_mu, comm_logstd, feat, new_hidden
+
+    def _forward_seq(self, x, scalars, hidden, comm_in):
+        """整條時間序列一次性 forward，消除 PPO 更新中的 for-t 迴圈。"""
+        T, B = x.shape[:2]
+        N = T * B
+
+        if hidden is None:
+            h0 = torch.zeros(1, B, self.hidden_size, device=x.device, dtype=x.dtype)
+            c0 = torch.zeros(1, B, self.hidden_size, device=x.device, dtype=x.dtype)
+            hidden = (h0, c0)
+
+        # 1. 攤平 CNN
+        x_flat  = x.reshape(N, *x.shape[2:])          # (T*B, C, H, W)
+        sc_flat = scalars.reshape(N, -1)               # (T*B, num_scalars)
+        embed   = self._cnn_embed(x_flat, sc_flat)     # (T*B, 256)
+
+        # 2. Cross-Attention（攤平處理，compile 友好）
+        prev_h = hidden[0].squeeze(0)                  # (B, 256)
+        prev_h_exp = prev_h.unsqueeze(0).expand(T, -1, -1).reshape(N, -1)  # (T*B, 256)
+
+        if comm_in is not None and comm_in.dim() == 4 and comm_in.size(2) > 0:
+            K = comm_in.size(2)
+            _comm = comm_in.reshape(N, K, self.num_comm)
+            _has_comm = 1.0
+        else:
+            _comm = torch.zeros(N, 1, self.num_comm, device=x.device, dtype=x.dtype)
+            _has_comm = 0.0
+
+        ctx = self._cross_attention(prev_h_exp, _comm)  # (T*B, 256)
+        ctx = ctx * _has_comm
+
+        # 3. 融合
+        fused = F.relu(self.fuse_norm(
+            self.fc_fuse(torch.cat([embed, ctx], dim=-1))
+        ))  # (T*B, 256)
+
+        # 4. reshape 成 (T, B, H) 送入 LSTM（batch_first=False）
+        fused_seq = fused.view(T, B, self.hidden_size)
+        lstm_out, new_hidden = self.lstm(fused_seq, hidden)
+        # lstm_out: (T, B, 256)
+
+        # 5. LayerNorm + 輸出頭
+        feat = self.lstm_norm(lstm_out)                            # (T, B, 256)
+        logits      = self.fc_actor(feat)                          # (T, B, 12)
+        comm_mu     = torch.tanh(self.fc_comm_mu(feat))            # (T, B, 4)
+        comm_logstd = self.fc_comm_logstd(feat).clamp(-4, 0)      # (T, B, 4)
 
         return logits, comm_mu, comm_logstd, feat, new_hidden
 

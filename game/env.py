@@ -734,7 +734,7 @@ class GameEnv:
         # 清理過期聲音波紋（使用 frame-based alive 判定）
         self.sound_waves = [w for w in self.sound_waves if w.alive(self.frame_count)]
 
-        # 敵人視野獎勵（per learning agent）
+        # 敵人視野與鎖定獎勵（per learning agent）
         for i, agent in enumerate(self.learning_agents):
             if agent.truly_dead() or agent.is_downed():
                 continue
@@ -742,6 +742,8 @@ class GameEnv:
             fx, fy = math.cos(frad), math.sin(frad)
             rx, ry = math.cos(frad + math.pi / 2), math.sin(frad + math.pi / 2)
             enemy_in_sight = False
+            best_angle = 180.0
+
             for other in self.all_agents:
                 if not other.alive() or other.team_id == agent.team_id:
                     continue
@@ -753,9 +755,26 @@ class GameEnv:
                 ang = math.degrees(math.atan2(rt, ft)) if dt > 0 else 0.0
                 if dt <= VIEW_RANGE and abs(ang) <= HALF_FOV and self.has_line_of_sight(agent.x, agent.y, other.x, other.y):
                     enemy_in_sight = True
-                    break
+                    if abs(ang) < best_angle:
+                        best_angle = abs(ang)
+                    # We continue checking to find the best angle
+
             if enemy_in_sight:
-                rewards[i] += 0.005  # RADAR_REWARD
+                rewards[i] += GameConfig.RADAR_REWARD
+                if self.stage_id in (0, 1):
+                    AIM_TOLERANCE = 15.0  # 目標必須在準星正負 15 度以內
+                    REQUIRED_FRAMES = 5   # 必須連續維持 5 個 Frame
+                    
+                    if best_angle <= AIM_TOLERANCE:
+                        agent.aim_frames += 1
+                    else:
+                        agent.aim_frames = 0
+                    
+                    if agent.aim_frames >= REQUIRED_FRAMES:
+                        rewards[i] += GameConfig.aim_reward
+                        agent.aim_frames = 0
+            else:
+                agent.aim_frames = 0
 
         # 碰撞懲罰
         for i, agent in enumerate(self.learning_agents):
@@ -840,12 +859,12 @@ class GameEnv:
                         # learning agent 獎勵
                         for i, la in enumerate(self.learning_agents):
                             if ag is la:
-                                rewards[i] -= 1.0
+                                rewards[i] -= GameConfig.DAMAGE_PENALTY
                             if g.owner is la and ag.team_id != la.team_id:
                                 if not was_downed_before:
-                                    rewards[i] += 1.0  # HIT_REWARD（非倒地目標）
+                                    rewards[i] += GameConfig.HIT_REWARD
                                 if just_downed:
-                                    rewards[i] += 10.0  # DOWN_REWARD
+                                    rewards[i] += GameConfig.DOWN_REWARD
                 if g in self.grenades_list:
                     self.grenades_list.remove(g)
 
@@ -873,13 +892,13 @@ class GameEnv:
                 if not agent.truly_dead() and not agent.is_downed():
                     rewards[i] += survival_bonus
 
-        # 存活懲罰
-        alive_enemy_cnt = len(self._alive_enemies())
+        # 存活懲罰：以「尚未倒地」的敵方 NPC 數量為基準
+        standing_enemies_cnt = sum(1 for e in self.enemy_agents if not e.truly_dead() and not e.is_downed())
         for i, agent in enumerate(self.learning_agents):
             if agent.truly_dead() or agent.is_downed():
                 continue
             if self.stage_id in (0, 1, 2, 3, 4):
-                rewards[i] -= 0.003 * alive_enemy_cnt
+                rewards[i] -= GameConfig.NPC_SURVIVAL_COST * standing_enemies_cnt
             else:
                 rewards[i] -= GameConfig.SURVIVAL_COST
 
@@ -888,6 +907,22 @@ class GameEnv:
             if not agent.truly_dead() and not agent.is_downed():
                 try_auto_pickup(agent, self.ground_items)
 
+        # 隊伍團滅檢查：所有存活成員皆為倒地狀態 => 團隊滅亡，全數轉換為 dead
+        teams = {}
+        for agent in self.all_agents:
+            if not agent.truly_dead():
+                teams.setdefault(agent.team_id, []).append(agent)
+                
+        for team_id, members in teams.items():
+            if all(m.is_downed() for m in members):
+                for m in members:
+                    m.downed = False
+                    m.hp = 0
+                # 發放擊殺獎勵給不同隊伍的 learning_agents
+                for i, la in enumerate(self.learning_agents):
+                    if la.team_id != team_id:
+                        rewards[i] += GameConfig.NPC_KILL_REWARD * len(members)
+
         # 結束判定
         done = False
         ai_win = False
@@ -895,6 +930,7 @@ class GameEnv:
 
         # 全員 truly_dead 才算役出（倒地中不算）
         any_la_alive = any(not a.truly_dead() for a in self.learning_agents)
+        alive_enemy_cnt = len(self._alive_enemies())
         enemies_alive = alive_enemy_cnt > 0
         allies_alive = len(self._alive_allies()) > 0
 
@@ -905,27 +941,27 @@ class GameEnv:
             if not any_la_alive or not enemies_alive or time_out:
                 done = True
                 if time_out and enemies_alive:
-                    team_reward -= 5.0  # ALIVE_NPC_PENALTY
+                    team_reward -= GameConfig.ALIVE_NPC_PENALTY
                 if any_la_alive and not enemies_alive:
                     ai_win = True
-                    team_reward += 10.0
+                    team_reward += GameConfig.WIN_REWARD
                 elif (not any_la_alive) and enemies_alive:
                     ai_lost = True
-                    team_reward -= 5.0
+                    team_reward -= GameConfig.LOSE_PENALTY
                 else:
-                    team_reward -= 6.0  # TIE
+                    team_reward -= GameConfig.TIE_PENALTY
 
         elif self.stage_id == 5:
             if not any_la_alive or not enemies_alive or self.frame_count >= self.stage_spec.max_frames:
                 done = True
                 if any_la_alive and not enemies_alive:
                     ai_win = True
-                    team_reward += 10.0
+                    team_reward += GameConfig.WIN_REWARD
                 elif (not any_la_alive) and enemies_alive:
                     ai_lost = True
-                    team_reward -= 5.0
+                    team_reward -= GameConfig.LOSE_PENALTY
                 else:
-                    team_reward -= 6.0
+                    team_reward -= GameConfig.TIE_PENALTY
 
         elif self.stage_id == 6:
             enemies_team_dead = not enemies_alive
@@ -934,15 +970,15 @@ class GameEnv:
                 done = True
                 if enemies_team_dead and not allies_team_dead:
                     ai_win = True
-                    team_reward += 10.0
+                    team_reward += GameConfig.WIN_REWARD
                 elif allies_team_dead and not enemies_team_dead:
                     ai_lost = True
-                    team_reward -= 5.0
+                    team_reward -= GameConfig.LOSE_PENALTY
                 else:
-                    team_reward -= 6.0
+                    team_reward -= GameConfig.TIE_PENALTY
 
         # final_reward = 0.6 * individual + 0.4 * team
-        final_rewards = [0.6 * rewards[i] + 0.4 * team_reward
+        final_rewards = [GameConfig.INDIVIDUAL_REWARD_WEIGHT * rewards[i] + GameConfig.TEAM_REWARD_WEIGHT * team_reward
                          for i in range(len(self.learning_agents))]
 
         info = {

@@ -25,7 +25,13 @@ class GameConfig:
     DASH_PENALTY = -0.2
     REGEN_AMOUNT = 20
 
+    AGENT_BASE_SPEED = 3.0
+    AGENT_MAX_HP = 100
+    INDIVIDUAL_REWARD_WEIGHT = 0.6
+    TEAM_REWARD_WEIGHT = 0.4
+
     HIT_REWARD = 2.0
+    DOWN_REWARD = 10.0
     DAMAGE_PENALTY = 1.0
     WIN_REWARD = 10.0
     LOSE_PENALTY = 5.0
@@ -37,6 +43,7 @@ class GameConfig:
     aim_reward = 0.02
     NPC_KILL_REWARD = 15.0
     ALIVE_NPC_PENALTY = 5.0
+    RADAR_REWARD = 0.005
 
 
 @dataclass(frozen=True)
