@@ -75,6 +75,12 @@ class Agent:
         self.heal_frames: int = 90     # 打一包藥需要的幀數
         self.heal_amount: int = 50     # 每包回復 HP
 
+        # ── 倒地系統 ──
+        self.downed: bool = False          # 是否處於倒地狀態
+        self.revive_progress: int = 0      # 救援累積幀數
+        self.revive_frames: int = 300      # 救援所需幀數（5 秒 × 60 FPS）
+        self.downed_speed_ratio: float = 0.2  # 倒地時移動速度倍率
+
     # ── properties ──
 
     @property
@@ -87,8 +93,16 @@ class Agent:
 
     # ── 存活 ──
 
-    def alive(self):
-        return self.hp > 0
+    def alive(self) -> bool:
+        """倒地或正常存活都回傳 True，只有 truly_dead() 為 True 才算徹底死亡。"""
+        return not self.truly_dead()
+
+    def truly_dead(self) -> bool:
+        """真正死亡：hp <= 0 且不處於倒地救援期（倒地資格用盡後 hp 仍 <= 0）。"""
+        return self.hp <= 0 and not self.downed
+
+    def is_downed(self) -> bool:
+        return self.downed
 
     # ── 基礎 tick ──
 
@@ -127,7 +141,7 @@ class Agent:
         rotation_noise_pct: 轉向速度誤差比例，0.05 = ±5%。
                             實際效果：turn_speed × uniform(1-pct, 1+pct)
         """
-        if not self.alive():
+        if self.truly_dead():
             return False, 0.0
 
         self._tick_base()
@@ -138,7 +152,10 @@ class Agent:
         turn_in = (1 if cw > 0.5 else 0) - (1 if ccw > 0.5 else 0)
 
         turn_speed = 1.5 if focus > 0.5 else 8.0
-        cur_speed = self.speed * (3 if self.dash_timer > 0 else 1)
+        if self.downed:
+            cur_speed = self.speed * self.downed_speed_ratio
+        else:
+            cur_speed = self.speed * (3 if self.dash_timer > 0 else 1)
 
         dash_reward = 0.0
         if dash_btn > 0.5 and self.dash_cd == 0 and self.dash_timer == 0 and self.hp > GameConfig.DASH_COST_HP:
@@ -202,15 +219,22 @@ class Agent:
         """
         mask = [True] * 12
 
+        # 倒地中：只允許移動（緩慢爬行），禁止一切戰鬥動作
+        if self.downed:
+            for i in range(12):
+                if i not in (0, 1, 2, 3):   # 只保留 up/down/left/right
+                    mask[i] = False
+            return mask
+
         # 換彈中：禁止 attack(6), switch_weapon(8)
         if self.reload_progress > 0:
             mask[6] = False
             mask[8] = False
 
-        # 打藥中：只允許轉向 (cw=4, ccw=5)
+        # 打藥中：只允許轉向 (cw=4, ccw=5) 與取消打藥 (use_medkit=9)
         if self.heal_progress > 0:
             for i in range(12):
-                if i not in (4, 5):
+                if i not in (4, 5, 9):
                     mask[i] = False
 
         # 沒有武器：禁止 attack(6)
@@ -288,6 +312,12 @@ class Agent:
         self.medkits -= 1
         self.heal_progress = 1
 
+    def cancel_heal(self):
+        """中斷打藥，並歸還藥包"""
+        if self.heal_progress > 0:
+            self.heal_progress = 0
+            self.medkits += 1
+
     def tick_heal(self) -> bool:
         """每幀呼叫，回傳 True 代表打藥完成"""
         if self.heal_progress <= 0:
@@ -296,6 +326,35 @@ class Agent:
         if self.heal_progress >= self.heal_frames:
             self.hp = min(self.max_hp, self.hp + self.heal_amount)
             self.heal_progress = 0
+            return True
+        return False
+
+    # ── 倒地救援 ──
+
+    def enter_downed(self):
+        """進入倒地狀態：hp 鎖在 1，清除各種讀條"""
+        self.downed = True
+        self.hp = 1
+        self.heal_progress = 0
+        self.reload_progress = 0
+        self.revive_progress = 0
+
+    def tick_revive(self, rescuer_nearby: bool) -> bool:
+        """
+        每幀呼叫：有隊友靠近時累積救援進度。
+        回傳 True 代表救援完成，Agent 已恢復戰力。
+        """
+        if not self.downed:
+            return False
+        if rescuer_nearby:
+            self.revive_progress += 1
+        else:
+            # 沒有隊友在旁邊時進度不消退（設計選擇：不累退，較寬鬆）
+            pass
+        if self.revive_progress >= self.revive_frames:
+            self.downed = False
+            self.revive_progress = 0
+            self.hp = max(1, int(self.max_hp * 0.2))  # 救起後 20% HP
             return True
         return False
 
