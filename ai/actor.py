@@ -90,6 +90,19 @@ class ConvLSTM(nn.Module):
         ))
         return embed
 
+    @torch.compiler.disable
+    def _chunked_cnn_checkpoint(self, x_flat, sc_flat):
+        """將編譯困難的迴圈抽離並關閉編譯，避免 Dynamo 發生 AssertionError"""
+        N = x_flat.size(0)
+        chunk_size = 2048
+        embed_chunks = []
+        for i in range(0, N, chunk_size):
+            cx = x_flat[i : i+chunk_size]
+            csc = sc_flat[i : i+chunk_size]
+            ce = gradient_checkpoint(self._cnn_embed, cx, csc, use_reentrant=False)
+            embed_chunks.append(ce)
+        return torch.cat(embed_chunks, dim=0)
+
     def _cross_attention(self, prev_h, comm_in):
         """Cross-Attention 通訊接收。
         prev_h:   (N, hidden_size)
@@ -147,7 +160,9 @@ class ConvLSTM(nn.Module):
             c0 = torch.zeros(1, B, self.hidden_size, device=x.device, dtype=x.dtype)
             hidden = (h0, c0)
 
-        # CNN（Gradient Checkpointing 節省 VRAM，不截斷 LSTM 模式成小歷史）
+        # CNN（Gradient Checkpointing 節省 VRAM）
+        # ⚠️ 必須讓至少一個輸入 requires_grad=True，否則 PyTorch 會略過 Checkpoint 的 backward 且不釋放 VRAM
+        x.requires_grad_(True)
         embed = gradient_checkpoint(
             self._cnn_embed, x, scalars, use_reentrant=False
         )  # (B, 256)
@@ -191,12 +206,16 @@ class ConvLSTM(nn.Module):
             c0 = torch.zeros(1, B, self.hidden_size, device=x.device, dtype=x.dtype)
             hidden = (h0, c0)
 
-        # 1. 攤平 CNN（Gradient Checkpointing 節省 VRAM）
+        # 1. 攤平 CNN（分塊 Gradient Checkpointing 節省 VRAM）
         x_flat  = x.reshape(N, *x.shape[2:])          # (T*B, C, H, W)
         sc_flat = scalars.reshape(N, -1)               # (T*B, num_scalars)
-        embed   = gradient_checkpoint(
-            self._cnn_embed, x_flat, sc_flat, use_reentrant=False
-        )  # (T*B, 256)
+        
+        # ⚠️ 必須讓至少一個輸入 requires_grad=True，否則 PyTorch 會略過 Checkpoint 導致 CNN 失憶且 VRAM 炸裂
+        x_flat.requires_grad_(True)
+        
+        # 分塊處理，防止 backward 時 T*B 一次性爆顯存 (解決導致 VRAM Peak 炸裂的真兇)
+        # 用 @torch.compiler.disable 的獨立函數包裹，防止 Dynamo 追蹤失敗
+        embed = self._chunked_cnn_checkpoint(x_flat, sc_flat)
 
         # 2. Cross-Attention（攤平處理，compile 友好）
         prev_h = hidden[0].squeeze(0)                  # (B, 256)

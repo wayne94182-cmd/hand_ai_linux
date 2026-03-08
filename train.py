@@ -37,7 +37,7 @@ logger = logging.getLogger(__name__)
 
 # ── 超參數 ──────────────────────────────────────────────
 FRAME_SKIP = 2
-NUM_ENVS = 32
+NUM_ENVS = 128
 GAMMA = 0.990
 GAE_LAMBDA = 0.95
 PPO_EPOCHS = 4
@@ -265,7 +265,9 @@ def train(resume_path=None, forced_stage=None, target_stage_eps=50000, n_ai=2):
     if device.type == "cuda":
         model  = torch.compile(model,  dynamic=True)
         critic = torch.compile(critic, dynamic=True)
-
+        pass
+        #     model  = torch.compile(model,  dynamic=True)
+        #     critic = torch.compile(critic, dynamic=True)
     total_eps_done = 0
     save_milestone = SAVE_EVERY
     resume_stage = 0
