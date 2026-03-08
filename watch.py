@@ -94,7 +94,7 @@ DEFAULT_SPEED_IDX = 2
 CELL = 8
 PAD = 8
 LABEL_H = 20
-CH_NAMES = ["地形", "敵人", "隊友", "威脅", "聲音", "安全區"]
+CH_NAMES = ["地形", "敵人", "隊友", "威脅", "聲音", "安全區", "武器", "醫療包", "手榴彈"]
 
 
 def parse_model_path(ckpt: str) -> str:

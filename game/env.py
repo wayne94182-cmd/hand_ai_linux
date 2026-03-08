@@ -39,7 +39,7 @@ from game.audio import (
 from game.npc import enemy_actions, teammate_actions
 
 # ─── 常數 ────────────────────────────────────────────
-NUM_CHANNELS = 6
+NUM_CHANNELS = 9
 NUM_SCALARS = 24
 
 # 散彈槍彈片角度偏移
@@ -460,6 +460,24 @@ class GameEnv:
             view[5] = float(np.clip(1.0 - dist_self / max(1.0, self.poison_radius), -1.0, 1.0))
         else:
             view[5] = 1.0
+
+        # Ch6: 武器, Ch7: 醫療包, Ch8: 手榴彈（地面道具雷達）
+        for item in self.ground_items:
+            dx = item.x - ax
+            dy = item.y - ay
+            ft = (dx * fwd_x + dy * fwd_y) / TILE_SIZE
+            rt = (dx * rgt_x + dy * rgt_y) / TILE_SIZE
+            dt = math.hypot(ft, rt)
+            ang = math.degrees(math.atan2(rt, ft)) if dt > 0 else 0.0
+            if dt <= VIEW_RANGE and abs(ang) <= HALF_FOV and self.has_line_of_sight(ax, ay, item.x, item.y):
+                dr = (ft + rt) / 1.41421356
+                dc = (ft - rt) / 1.41421356
+                if item.item_type == "weapon":
+                    self._inject_value(view[6], VIEW_CENTER + dr, VIEW_CENTER + dc, 1.0)
+                elif item.item_type == "medkit":
+                    self._inject_value(view[7], VIEW_CENTER + dr, VIEW_CENTER + dc, 1.0)
+                elif item.item_type == "grenade":
+                    self._inject_value(view[8], VIEW_CENTER + dr, VIEW_CENTER + dc, 1.0)
 
         # ── 24 純量 ──
         # weapon one-hot

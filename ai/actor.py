@@ -13,14 +13,14 @@ from torch.distributions import Bernoulli, Normal
 HIDDEN_SIZE = 256
 NUM_ACTIONS_DISCRETE = 12   # Bernoulli 動作
 NUM_COMM = 4                # 連續通訊向量維度
-IN_CHANNELS = 6
+IN_CHANNELS = 9
 NUM_SCALARS = 24
 
 
 class ConvLSTM(nn.Module):
     """
     CNN + LSTM Actor，支援：
-    1. 6 通道輸入
+    1. 9 通道輸入（地形/敵人/隊友/威脅/聲音/安全區/武器/醫療包/手榴彈）
     2. LSTM 雙狀態 (h, c)
     3. 12 個離散動作（Bernoulli）
     4. 4 維連續通訊向量（Normal distribution）
@@ -39,16 +39,16 @@ class ConvLSTM(nn.Module):
         self.num_actions = num_actions
         self.num_comm = num_comm
 
-        # ── CNN（與原架構相同，只改 in_channels）──
-        self.conv1 = nn.Conv2d(in_channels, 16, 3, 1, 1)
-        self.bn1   = nn.GroupNorm(4, 16)
-        self.conv2 = nn.Conv2d(16, 32, 3, 2, 1)
-        self.bn2   = nn.GroupNorm(8, 32)
-        self.conv3 = nn.Conv2d(32, 64, 3, 2, 1)
-        self.bn3   = nn.GroupNorm(8, 64)
-        # 輸出: (B, 64, 4, 4) → flatten 1024
+        # ── CNN（加寬版：32→64→128，Flatten 後 2048）──
+        self.conv1 = nn.Conv2d(in_channels, 32, 3, 1, 1)
+        self.bn1   = nn.GroupNorm(8, 32)
+        self.conv2 = nn.Conv2d(32, 64, 3, 2, 1)
+        self.bn2   = nn.GroupNorm(8, 64)
+        self.conv3 = nn.Conv2d(64, 128, 3, 2, 1)
+        self.bn3   = nn.GroupNorm(16, 128)
+        # 輸出: (B, 128, 4, 4) → flatten 後為 128 * 4 * 4 = 2048
 
-        self.fc_embed = nn.Linear(1024 + num_scalars, hidden_size)
+        self.fc_embed = nn.Linear(2048 + num_scalars, hidden_size)
         self.embed_norm = nn.LayerNorm(hidden_size)
 
         # ── Cross-Attention 通訊接收器 ──

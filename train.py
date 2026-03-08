@@ -36,7 +36,7 @@ logger = logging.getLogger(__name__)
 
 # ── 超參數 ──────────────────────────────────────────────
 FRAME_SKIP = 2
-NUM_ENVS = 64
+NUM_ENVS = 32
 GAMMA = 0.990
 GAE_LAMBDA = 0.95
 PPO_EPOCHS = 4
