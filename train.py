@@ -224,11 +224,11 @@ def load_checkpoint(path, model, critic, optimizer, optimizer_critic, device):
     ckpt = torch.load(path, map_location=device)
 
     if isinstance(ckpt, dict) and "model_state" in ckpt:
-        model.load_state_dict(ckpt["model_state"])
+        _unwrap(model).load_state_dict(ckpt["model_state"])
         if optimizer is not None and "optimizer_state" in ckpt:
             optimizer.load_state_dict(ckpt["optimizer_state"])
         if critic is not None and "critic_state" in ckpt:
-            critic.load_state_dict(ckpt["critic_state"])
+            _unwrap(critic).load_state_dict(ckpt["critic_state"])
         if optimizer_critic is not None and "optimizer_critic_state" in ckpt:
             optimizer_critic.load_state_dict(ckpt["optimizer_critic_state"])
         return (int(ckpt.get("total_eps_done", 0)),
