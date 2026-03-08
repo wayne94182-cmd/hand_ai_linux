@@ -42,8 +42,6 @@ from game.npc import enemy_actions, teammate_actions
 NUM_CHANNELS = 9
 NUM_SCALARS = 24
 
-# 散彈槍彈片角度偏移
-_SHOTGUN_OFFSETS = [-30.0, -15.0, 0.0, 15.0, 30.0]
 
 # 道具生成權重
 _WEAPON_WEIGHTS = [0.3, 0.4, 0.2, 0.1]  # PISTOL, RIFLE, SHOTGUN, SNIPER
@@ -649,7 +647,7 @@ class GameEnv:
             dmg = self.enemy_damage if agent.team.startswith("enemy") else self.bullet_damage
             if wp:
                 dmg = wp.damage
-            for offset in _SHOTGUN_OFFSETS:
+            for offset in wp.pellet_offsets:
                 pellet_angle = (agent.angle + offset) % 360
                 self.projectiles.append(
                     Projectile(sx, sy, pellet_angle, owner=agent, damage=dmg, weapon_spec=wp)

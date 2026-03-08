@@ -20,9 +20,10 @@ import torch.optim as optim
 from torch.distributions import Bernoulli, Normal
 from tqdm import tqdm
 
-from ai import ConvLSTM, TeamPoolingCritic, CommHandler, HIDDEN_SIZE, NUM_COMM
+from ai import ConvLSTM, TeamPoolingCritic, CommHandler, HIDDEN_SIZE, NUM_COMM, NUM_ACTIONS_DISCRETE
 from game import GameEnv, get_stage_spec
 from game.env import NUM_CHANNELS, NUM_SCALARS
+from game.config import VIEW_SIZE
 
 logging.basicConfig(
     level=logging.INFO,
@@ -46,7 +47,7 @@ ENT_START = 0.1
 ENT_END = 0.03
 LR = 3e-4
 MAX_GRAD = 0.5
-TOTAL_EPS = 50000
+
 ROLLING_WIN_WINDOW = 200
 SAVE_EVERY = 2500
 STOP_SIGNAL_FILE = "STOP_AND_SAVE"
@@ -334,7 +335,7 @@ def train(resume_path=None, forced_stage=None, target_stage_eps=50000, n_ai=2):
         # env_states[j] = list of n_ai (view, scalar, team_id) tuples
 
         # 追蹤每個 flat index 目前的 action mask
-        last_masks = np.ones((FLAT_BATCH, 12), dtype=bool)
+        last_masks = np.ones((FLAT_BATCH, NUM_ACTIONS_DISCRETE), dtype=bool)
 
         # 軌跡收集（per flat index）
         traj = [{"states": [], "actions": [], "rewards": [], "values": [],
@@ -347,7 +348,7 @@ def train(resume_path=None, forced_stage=None, target_stage_eps=50000, n_ai=2):
 
         while not all(episode_done):
             # 1. 從 NUM_ENVS 個環境收集狀態
-            s_np = np.zeros((NUM_ENVS, n_ai, NUM_CHANNELS, 15, 15), dtype=np.float32)
+            s_np = np.zeros((NUM_ENVS, n_ai, NUM_CHANNELS, VIEW_SIZE, VIEW_SIZE), dtype=np.float32)
             sc_np = np.zeros((NUM_ENVS, n_ai, NUM_SCALARS), dtype=np.float32)
             team_ids = np.zeros((NUM_ENVS, n_ai), dtype=np.int32)
             for j in range(NUM_ENVS):
@@ -357,7 +358,7 @@ def train(resume_path=None, forced_stage=None, target_stage_eps=50000, n_ai=2):
                     team_ids[j, i] = int(env_states[j][i][2])
 
             # 2. 展平：先 AI index，再 env index
-            s_flat = s_np.transpose(1, 0, 2, 3, 4).reshape(FLAT_BATCH, NUM_CHANNELS, 15, 15)
+            s_flat = s_np.transpose(1, 0, 2, 3, 4).reshape(FLAT_BATCH, NUM_CHANNELS, VIEW_SIZE, VIEW_SIZE)
             sc_flat = sc_np.transpose(1, 0, 2).reshape(FLAT_BATCH, NUM_SCALARS)
 
             s_t = torch.as_tensor(s_flat, dtype=torch.float32, device=device)
@@ -439,7 +440,7 @@ def train(resume_path=None, forced_stage=None, target_stage_eps=50000, n_ai=2):
                         torch.from_numpy(last_masks[flat].copy()))
 
             # 6. 還原形狀派發給 env
-            acts_env = acts_np.reshape(n_ai, NUM_ENVS, 12).transpose(1, 0, 2)
+            acts_env = acts_np.reshape(n_ai, NUM_ENVS, NUM_ACTIONS_DISCRETE).transpose(1, 0, 2)
             last_comm = comm_np_new.copy()
 
             env_actions = []
@@ -460,10 +461,10 @@ def train(resume_path=None, forced_stage=None, target_stage_eps=50000, n_ai=2):
                     traj[flat]["rewards"].append(float(rew))
 
                 # Fix 2B: 從 info 取回真實 action mask
-                raw_masks = infos[j].get("action_masks", [[True]*12]*n_ai)
+                raw_masks = infos[j].get("action_masks", [[True]*NUM_ACTIONS_DISCRETE for _ in range(n_ai)])
                 for i in range(n_ai):
                     flat = i * NUM_ENVS + j
-                    last_masks[flat] = np.array(raw_masks[i], dtype=bool) if i < len(raw_masks) else np.ones(12, dtype=bool)
+                    last_masks[flat] = np.array(raw_masks[i], dtype=bool) if i < len(raw_masks) else np.ones(NUM_ACTIONS_DISCRETE, dtype=bool)
 
                 if dones[j]:
                     episode_done[j] = True
@@ -517,9 +518,9 @@ def train(resume_path=None, forced_stage=None, target_stage_eps=50000, n_ai=2):
         t_per_flat = [len(traj[f]["states"]) for f in range(FLAT_BATCH)]
         max_t = max(t_per_flat) if t_per_flat and max(t_per_flat) > 0 else 1
 
-        bat_states = torch.zeros(max_t, FLAT_BATCH, NUM_CHANNELS, 15, 15)
+        bat_states = torch.zeros(max_t, FLAT_BATCH, NUM_CHANNELS, VIEW_SIZE, VIEW_SIZE)
         bat_scalars = torch.zeros(max_t, FLAT_BATCH, NUM_SCALARS)
-        bat_actions = torch.zeros(max_t, FLAT_BATCH, 12)
+        bat_actions = torch.zeros(max_t, FLAT_BATCH, NUM_ACTIONS_DISCRETE)
         bat_old_lp = torch.zeros(max_t, FLAT_BATCH)
         bat_adv = torch.zeros(max_t, FLAT_BATCH)
         bat_ret = torch.zeros(max_t, FLAT_BATCH)
@@ -527,7 +528,7 @@ def train(resume_path=None, forced_stage=None, target_stage_eps=50000, n_ai=2):
         bat_comm_lp = torch.zeros(max_t, FLAT_BATCH)
         bat_comm_mu = torch.zeros(max_t, FLAT_BATCH, NUM_COMM)
         bat_comm_logstd = torch.zeros(max_t, FLAT_BATCH, NUM_COMM)
-        bat_masks = torch.ones(max_t, FLAT_BATCH, 12, dtype=torch.bool)
+        bat_masks = torch.ones(max_t, FLAT_BATCH, NUM_ACTIONS_DISCRETE, dtype=torch.bool)
         mask = torch.zeros(max_t, FLAT_BATCH, dtype=torch.bool)
 
         for f in range(FLAT_BATCH):
@@ -608,8 +609,8 @@ def train(resume_path=None, forced_stage=None, target_stage_eps=50000, n_ai=2):
                     comm_in=None,
                     seq_mode=True
                 )
-            # logits_all: (max_t, FLAT_BATCH, 12)
-            # feat_all:   (max_t, FLAT_BATCH, 256)
+            # logits_all: (max_t, FLAT_BATCH, NUM_ACTIONS_DISCRETE)
+            # feat_all:   (max_t, FLAT_BATCH, HIDDEN_SIZE)
 
             logits_all = logits_all.float()
             feat_all   = feat_all.float()
@@ -619,18 +620,18 @@ def train(resume_path=None, forced_stage=None, target_stage_eps=50000, n_ai=2):
             valid_flat = mask.reshape(TB)                             # (TB,)
             n_valid = valid_flat.float().sum().clamp(min=1)
 
-            logits_flat = logits_all.reshape(TB, 12)
+            logits_flat = logits_all.reshape(TB, NUM_ACTIONS_DISCRETE)
             mu_flat     = mu_all.reshape(TB, NUM_COMM)
             logstd_flat = logstd_all.reshape(TB, NUM_COMM)
             feat_flat   = feat_all.reshape(TB, HIDDEN_SIZE)
 
-            a_flat      = bat_actions.reshape(TB, 12)
+            a_flat      = bat_actions.reshape(TB, NUM_ACTIONS_DISCRETE)
             lp_old_flat = bat_old_lp.reshape(TB)
             adv_flat    = bat_adv.reshape(TB)
             ret_flat    = bat_ret.reshape(TB)
             ca_flat     = bat_comm_acts.reshape(TB, NUM_COMM)
             clp_flat    = bat_comm_lp.reshape(TB)
-            m_act_flat  = bat_masks.reshape(TB, 12)
+            m_act_flat  = bat_masks.reshape(TB, NUM_ACTIONS_DISCRETE)
 
             # Action Masking
             logits_masked = logits_flat.masked_fill(~m_act_flat, -1e9)
@@ -660,7 +661,7 @@ def train(resume_path=None, forced_stage=None, target_stage_eps=50000, n_ai=2):
             t_actor_loss = (total_actor * valid_flat.float()).sum() / n_valid
 
             # Critic（需按 team 分組）
-            feat_d = feat_flat.detach()   # (TB, 256)
+            feat_d = feat_flat.detach()   # (TB, HIDDEN_SIZE)
 
             # 展平 team mask: (max_t, FLAT_BATCH) → (TB,)
             # 每個時間步的 team 分配都一樣，所以直接 expand
@@ -688,17 +689,17 @@ def train(resume_path=None, forced_stage=None, target_stage_eps=50000, n_ai=2):
             critic_l = (v_pred_flat - ret_flat).pow(2)
             t_critic_loss = (critic_l * valid_flat.float()).sum() / n_valid
 
-            # Actor backward
+            # Actor + Critic backward（兩者都過 scaler，確保 AMP 正確縮放）
             scaler.scale(t_actor_loss).backward()
+            scaler.scale(t_critic_loss * VALUE_COEF).backward()
+
             scaler.unscale_(optimizer)
+            scaler.unscale_(optimizer_critic)
             torch.nn.utils.clip_grad_norm_(_unwrap(model).parameters(), MAX_GRAD)
-            scaler.step(optimizer)
-
-            # Critic backward
-            (t_critic_loss * VALUE_COEF).backward()
             torch.nn.utils.clip_grad_norm_(_unwrap(critic).parameters(), MAX_GRAD)
-            optimizer_critic.step()
 
+            scaler.step(optimizer)
+            scaler.step(optimizer_critic)
             scaler.update()
 
         total_eps_done += NUM_ENVS

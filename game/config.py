@@ -47,6 +47,21 @@ class GameConfig:
     REVIVE_REWARD = 5.0
 
 
+@dataclass
+class AudioConfig:
+    FOOTSTEP_EXPAND_SPEED: float = 90.0
+    FOOTSTEP_MAX_RADIUS:   float = 240.0
+    RELOAD_MAX_RADIUS:     float = 360.0
+    GUNSHOT_MAX_RADIUS:    float = 600.0
+    EXPLOSION_MAX_RADIUS:  float = 960.0
+
+
+@dataclass
+class NpcConfig:
+    AVOID_RADIUS:      float = 150.0
+    RETREAT_TIMER_SEC: int   = 4
+
+
 @dataclass(frozen=True)
 class StageSpec:
     stage_id: int

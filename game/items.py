@@ -17,6 +17,7 @@ class WeaponSpec:
     is_sniper: bool = False
     is_shotgun: bool = False
     pellet_count: int = 1  # 散彈同時發射的彈片數
+    pellet_offsets: list = field(default_factory=list)
 
 
 # 四把武器的精確數值
@@ -37,7 +38,8 @@ SHOTGUN = WeaponSpec(
     reload_frames=180, fire_cooldown=35,
     bullet_speed=15.0, bullet_life=10,
     spread_deg=0.0, heatmap_value=0.4,
-    is_shotgun=True, pellet_count=5
+    is_shotgun=True, pellet_count=5,
+    pellet_offsets=[-30.0, -15.0, 0.0, 15.0, 30.0]
     # 5 發彈片，各自散開 0, ±15, ±30 度
 )
 SNIPER = WeaponSpec(

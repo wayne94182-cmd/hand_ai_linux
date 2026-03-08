@@ -9,6 +9,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import Bernoulli, Normal
+from torch.utils.checkpoint import checkpoint as gradient_checkpoint
 
 HIDDEN_SIZE = 256
 NUM_ACTIONS_DISCRETE = 12   # Bernoulli 動作
@@ -146,8 +147,10 @@ class ConvLSTM(nn.Module):
             c0 = torch.zeros(1, B, self.hidden_size, device=x.device, dtype=x.dtype)
             hidden = (h0, c0)
 
-        # CNN
-        embed = self._cnn_embed(x, scalars)  # (B, 256)
+        # CNN（Gradient Checkpointing 節省 VRAM，不截斷 LSTM 模式成小歷史）
+        embed = gradient_checkpoint(
+            self._cnn_embed, x, scalars, use_reentrant=False
+        )  # (B, 256)
 
         # Cross-Attention（compile 友好：避免 if/else graph break）
         prev_h = hidden[0].squeeze(0)     # (B, 256)
@@ -188,10 +191,12 @@ class ConvLSTM(nn.Module):
             c0 = torch.zeros(1, B, self.hidden_size, device=x.device, dtype=x.dtype)
             hidden = (h0, c0)
 
-        # 1. 攤平 CNN
+        # 1. 攤平 CNN（Gradient Checkpointing 節省 VRAM）
         x_flat  = x.reshape(N, *x.shape[2:])          # (T*B, C, H, W)
         sc_flat = scalars.reshape(N, -1)               # (T*B, num_scalars)
-        embed   = self._cnn_embed(x_flat, sc_flat)     # (T*B, 256)
+        embed   = gradient_checkpoint(
+            self._cnn_embed, x_flat, sc_flat, use_reentrant=False
+        )  # (T*B, 256)
 
         # 2. Cross-Attention（攤平處理，compile 友好）
         prev_h = hidden[0].squeeze(0)                  # (B, 256)

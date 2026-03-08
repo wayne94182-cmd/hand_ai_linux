@@ -8,7 +8,7 @@ import math
 import numpy as np
 from dataclasses import dataclass
 
-from game.config import TILE_SIZE, VIEW_SIZE, VIEW_CENTER
+from game.config import TILE_SIZE, VIEW_SIZE, VIEW_CENTER, AudioConfig
 
 
 @dataclass
@@ -18,7 +18,7 @@ class SoundWave:
     birth_frame: int             # 出生時的 frame_count
     max_radius: float            # 最大傳播半徑後消滅
     sound_value: float           # 0.3=腳步, 0.6=換彈/打藥, 1.0=槍聲/爆炸
-    expand_speed: float = 90.0   # pixel/frame，約 2.25 格/frame
+    expand_speed: float = AudioConfig.FOOTSTEP_EXPAND_SPEED   # pixel/frame，約 2.25 格/frame
 
     def radius_at(self, frame: int) -> float:
         return (frame - self.birth_frame) * self.expand_speed
@@ -30,16 +30,16 @@ class SoundWave:
 # ─── 工廠函式（由 env 呼叫，傳入 frame_count）──────────
 
 def create_footstep_wave(x: float, y: float, frame: int) -> SoundWave:
-    return SoundWave(x, y, birth_frame=frame, max_radius=240.0, sound_value=0.3)
+    return SoundWave(x, y, birth_frame=frame, max_radius=AudioConfig.FOOTSTEP_MAX_RADIUS, sound_value=0.3)
 
 def create_reload_wave(x: float, y: float, frame: int) -> SoundWave:
-    return SoundWave(x, y, birth_frame=frame, max_radius=360.0, sound_value=0.6)
+    return SoundWave(x, y, birth_frame=frame, max_radius=AudioConfig.RELOAD_MAX_RADIUS, sound_value=0.6)
 
 def create_gunshot_wave(x: float, y: float, frame: int) -> SoundWave:
-    return SoundWave(x, y, birth_frame=frame, max_radius=600.0, sound_value=1.0)
+    return SoundWave(x, y, birth_frame=frame, max_radius=AudioConfig.GUNSHOT_MAX_RADIUS, sound_value=1.0)
 
 def create_explosion_wave(x: float, y: float, frame: int) -> SoundWave:
-    return SoundWave(x, y, birth_frame=frame, max_radius=960.0, sound_value=1.0)
+    return SoundWave(x, y, birth_frame=frame, max_radius=AudioConfig.EXPLOSION_MAX_RADIUS, sound_value=1.0)
 
 
 # ─── 雙線性插值（與 env._inject_value 邏輯相同）─────────

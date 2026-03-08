@@ -9,7 +9,7 @@ import random
 from game.config import (
     TILE_SIZE, FPS, NUM_ACTIONS,
     VIEW_RANGE, HALF_FOV,
-    GameConfig,
+    GameConfig, NpcConfig,
 )
 
 
@@ -64,7 +64,7 @@ def aim_and_shoot_actions(env, shooter, target, fire_rate, spread_deg, use_fov=T
     return actions
 
 
-def avoidance_actions(env, agent, avoid_radius=150.0):
+def avoidance_actions(env, agent, avoid_radius=NpcConfig.AVOID_RADIUS):
     rx, ry = 0.0, 0.0
     count = 0
     for other in env.all_agents:
@@ -299,7 +299,7 @@ def retreat_npc_actions(env, enemy, target):
         enemy.retreat_strafe_timer = 0
         enemy.retreat_strafe_dir = random.choice([-1, 1])
     if not hasattr(enemy, 'retreat_timer'):
-        enemy.retreat_timer = FPS * 4
+        enemy.retreat_timer = FPS * NpcConfig.RETREAT_TIMER_SEC
 
     if enemy.retreat_strafe_timer <= 0:
         enemy.retreat_strafe_timer = random.randint(18, 45)
@@ -375,21 +375,21 @@ def combat_npc_actions(env, enemy):
 
     if enemy.npc_state == 'combat' and hp_ratio < 0.25:
         enemy.npc_state = 'retreat'
-        enemy.retreat_timer = FPS * 4
+        enemy.retreat_timer = FPS * NpcConfig.RETREAT_TIMER_SEC
 
     if enemy.npc_state == 'retreat' and enemy.retreat_timer <= 0:
         enemy.npc_state = 'regen'
 
     if enemy.npc_state == 'regen' and dist < 280:
         enemy.npc_state = 'retreat'
-        enemy.retreat_timer = FPS * 4
+        enemy.retreat_timer = FPS * NpcConfig.RETREAT_TIMER_SEC
 
     if enemy.npc_state in ('retreat', 'regen') and hp_ratio >= 0.25:
         enemy.npc_state = 'combat' if ai_sees_me else 'wander'
 
     # 行為執行
     if enemy.npc_state == 'wander':
-        avoid = avoidance_actions(env, enemy, avoid_radius=150.0)
+        avoid = avoidance_actions(env, enemy, avoid_radius=NpcConfig.AVOID_RADIUS)
         actions = avoid if avoid else random_wander_actions(env, enemy, allow_shoot=False)
     elif enemy.npc_state == 'retreat':
         actions = retreat_npc_actions(env, enemy, target)
@@ -431,7 +431,7 @@ def enemy_actions(env, enemy):
     can_shoot = env.stage_spec.enemy_can_shoot or enemy.bot_type in ("turret_walk", "assault")
 
     if not can_shoot:
-        avoid = avoidance_actions(env, enemy, avoid_radius=150.0)
+        avoid = avoidance_actions(env, enemy, avoid_radius=NpcConfig.AVOID_RADIUS)
         if avoid:
             return avoid
         return random_wander_actions(env, enemy, allow_shoot=False)
@@ -461,7 +461,7 @@ def enemy_actions(env, enemy):
 def teammate_actions(env, mate):
     if not mate.alive():
         return [0.0] * NUM_ACTIONS
-    avoid = avoidance_actions(env, mate, avoid_radius=150.0)
+    avoid = avoidance_actions(env, mate, avoid_radius=NpcConfig.AVOID_RADIUS)
     if avoid:
         return avoid
     return random_wander_actions(env, mate, allow_shoot=False)
