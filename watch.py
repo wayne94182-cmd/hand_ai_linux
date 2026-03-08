@@ -425,8 +425,12 @@ def watch_ai(ckpt: str, stage_id: int,
                             logits, mu, logstd, _, new_hidden = model(
                                 s0_t, s1_t, hiddens[i], comm_in_t)
 
+                            # 套用 Action Masking（與 train.py 一致）
+                            mask = env.learning_agents[i].get_action_mask()
+                            mask_t = torch.tensor(mask, dtype=torch.bool, device=device)
+                            logits_masked = logits[0].masked_fill(~mask_t, -1e9)
                             # 離散動作: Bernoulli 取樣
-                            probs = torch.sigmoid(logits[0])
+                            probs = torch.sigmoid(logits_masked)
                             act = (probs > 0.5).float().cpu().tolist()
 
                             # 更新通訊向量

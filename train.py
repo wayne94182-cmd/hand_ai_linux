@@ -71,12 +71,17 @@ def resolve_stage(resume_stage, forced_stage=None):
     return resume_stage
 
 
-def compute_gae(rewards, values, gamma=GAMMA, lam=GAE_LAMBDA):
+def compute_gae(rewards, values, last_value=0.0, truncated=False, gamma=GAMMA, lam=GAE_LAMBDA):
     advantages = []
     gae = 0.0
+    # 若為 Timeout（非真實 done），使用 critic 估算的 last_value 作為 bootstrap
+    next_v = last_value if truncated else 0.0
     for t in reversed(range(len(rewards))):
-        next_v = values[t + 1] if t < len(rewards) - 1 else 0.0
-        delta = rewards[t] + gamma * next_v - values[t]
+        if t < len(rewards) - 1:
+            next_v_t = values[t + 1]
+        else:
+            next_v_t = next_v
+        delta = rewards[t] + gamma * next_v_t - values[t]
         gae = delta + gamma * lam * gae
         advantages.insert(0, gae)
     return advantages
@@ -476,6 +481,13 @@ def train(resume_path=None, forced_stage=None, target_stage_eps=50000, n_ai=2):
             env_states = next_env_states
 
         # ── GAE ──
+        # 判斷本次 rollout 是 done 還是 timeout（所有 env 都 done 表示真實 done）
+        # 若有任何 env 是因達到 max_frames 而結束（timeout），需要 bootstrap
+        # 此處簡化處理：每個 env 的結束情況已儲存在 episode_done 與 infos 裡，
+        # 使用 info.get('timeout', False) 判斷；若無此欄位，預設為 False
+        env_timeout = [infos[j].get("timeout", False) for j in range(NUM_ENVS)]
+
+        # 對需要 bootstrap 的 flat index，用最後一步的 value 估算 last_value
         all_advs = []
         for flat in range(FLAT_BATCH):
             rews = traj[flat]["rewards"]
@@ -484,7 +496,11 @@ def train(resume_path=None, forced_stage=None, target_stage_eps=50000, n_ai=2):
                 traj[flat]["advantages"] = []
                 traj[flat]["returns"] = []
                 continue
-            advs = compute_gae(rews, vals)
+            j = flat % NUM_ENVS
+            is_timeout = env_timeout[j]
+            # last_value: 若 timeout，使用最後一步的 critic value 作 bootstrap
+            last_val = vals[-1] if is_timeout else 0.0
+            advs = compute_gae(rews, vals, last_value=last_val, truncated=is_timeout)
             rets = [a + v for a, v in zip(advs, vals)]
             traj[flat]["advantages"] = advs
             traj[flat]["returns"] = rets
