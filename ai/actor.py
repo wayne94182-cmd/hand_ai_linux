@@ -196,8 +196,9 @@ class ConvLSTM(nn.Module):
 
         return logits, comm_mu, comm_logstd, feat, new_hidden
 
+    @torch.compiler.disable
     def _forward_seq(self, x, scalars, hidden, comm_in):
-        """整條時間序列一次性 forward，消除 PPO 更新中的 for-t 迴圈。"""
+        """整條時間序列 forward，CNN 平行分塊，LSTM 保持時序正確性。"""
         T, B = x.shape[:2]
         N = T * B
 
@@ -206,49 +207,60 @@ class ConvLSTM(nn.Module):
             c0 = torch.zeros(1, B, self.hidden_size, device=x.device, dtype=x.dtype)
             hidden = (h0, c0)
 
-        # 1. 攤平 CNN（分塊 Gradient Checkpointing 節省 VRAM）
+        # 1. 攤平 CNN（分塊 Gradient Checkpointing 節省 VRAM，此處可完全平行）
         x_flat  = x.reshape(N, *x.shape[2:])          # (T*B, C, H, W)
-        sc_flat = scalars.reshape(N, -1)               # (T*B, num_scalars)
+        sc_flat = scalars.reshape(N, -1)              # (T*B, num_scalars)
         
-        # ⚠️ 必須讓至少一個輸入 requires_grad=True，否則 PyTorch 會略過 Checkpoint 導致 CNN 失憶且 VRAM 炸裂
+        # ⚠️ 啟動 Checkpoint 必須的 flag
         x_flat.requires_grad_(True)
         
-        # 分塊處理，防止 backward 時 T*B 一次性爆顯存 (解決導致 VRAM Peak 炸裂的真兇)
-        # 用 @torch.compiler.disable 的獨立函數包裹，防止 Dynamo 追蹤失敗
-        embed = self._chunked_cnn_checkpoint(x_flat, sc_flat)
+        # 分塊處理 CNN
+        embed_flat = self._chunked_cnn_checkpoint(x_flat, sc_flat)
+        
+        # 將 CNN 特徵轉回時序維度 (T, B, hidden_size)
+        embed_seq = embed_flat.view(T, B, self.hidden_size)
 
-        # 2. Cross-Attention（攤平處理，compile 友好）
-        prev_h = hidden[0].squeeze(0)                  # (B, 256)
-        prev_h_exp = prev_h.unsqueeze(0).expand(T, -1, -1).reshape(N, -1)  # (T*B, 256)
-
-        if comm_in is not None and comm_in.dim() == 4 and comm_in.size(2) > 0:
-            K = comm_in.size(2)
-            _comm = comm_in.reshape(N, K, self.num_comm)
-            _has_comm = 1.0
+        # ====== 2. 修正致命 Bug：用 for 迴圈重建 Attention 與 LSTM 的時序依賴 ======
+        h_t, c_t = hidden
+        lstm_out_list = []
+        
+        # 判斷是否有有效的通訊張量，並預先準備 dummy 以防 Graph Break
+        has_comm = (comm_in is not None and comm_in.dim() == 4 and comm_in.size(2) > 0)
+        if has_comm:
+            _has_comm_scale = 1.0
+            _dummy_comm = None
         else:
-            _comm = torch.zeros(N, 1, self.num_comm, device=x.device, dtype=x.dtype)
-            _has_comm = 0.0
+            _has_comm_scale = 0.0
+            _dummy_comm = torch.zeros(B, 1, self.num_comm, device=x.device, dtype=x.dtype)
 
-        ctx = self._cross_attention(prev_h_exp, _comm)  # (T*B, 256)
-        ctx = ctx * _has_comm
+        for t in range(T):
+            curr_embed = embed_seq[t]              # 當前步的 CNN 特徵 (B, 256)
+            prev_h = h_t.squeeze(0)                # 取出上一步「真實」的 h (B, 256)
+            
+            # Cross-Attention (使用 Dummy + Mask 乘法，防 Graph Break)
+            curr_comm = comm_in[t] if has_comm else _dummy_comm
+            ctx = self._cross_attention(prev_h, curr_comm) * _has_comm_scale
+                
+            # 融合特徵
+            fused = F.relu(self.fuse_norm(
+                self.fc_fuse(torch.cat([curr_embed, ctx], dim=-1))
+            ))
+            
+            # LSTM 單步前向傳播 (要求輸入維度 1, B, H)
+            lstm_in = fused.unsqueeze(0)
+            out_t, (h_t, c_t) = self.lstm(lstm_in, (h_t, c_t))
+            lstm_out_list.append(out_t.squeeze(0)) # 收集這步的結果 (B, 256)
+            
+        # 將 T 步的結果重新堆疊成 (T, B, 256)
+        lstm_out = torch.stack(lstm_out_list, dim=0)
 
-        # 3. 融合
-        fused = F.relu(self.fuse_norm(
-            self.fc_fuse(torch.cat([embed, ctx], dim=-1))
-        ))  # (T*B, 256)
-
-        # 4. reshape 成 (T, B, H) 送入 LSTM（batch_first=False）
-        fused_seq = fused.view(T, B, self.hidden_size)
-        lstm_out, new_hidden = self.lstm(fused_seq, hidden)
-        # lstm_out: (T, B, 256)
-
-        # 5. LayerNorm + 輸出頭
+        # 3. LayerNorm + 輸出頭（可再次平行運算）
         feat = self.lstm_norm(lstm_out)                            # (T, B, 256)
-        logits      = self.fc_actor(feat)                          # (T, B, 12)
+        logits      = self.fc_actor(feat)                          # (T, B, self.num_actions)
         comm_mu     = torch.tanh(self.fc_comm_mu(feat))            # (T, B, 4)
-        comm_logstd = self.fc_comm_logstd(feat).clamp(-4, 0)      # (T, B, 4)
+        comm_logstd = self.fc_comm_logstd(feat).clamp(-4, 0)       # (T, B, 4)
 
-        return logits, comm_mu, comm_logstd, feat, new_hidden
+        return logits, comm_mu, comm_logstd, feat, (h_t, c_t)
 
     def get_action(self, state, hidden=None, comm_in=None, deterministic=False):
         """
