@@ -202,7 +202,11 @@ class Agent:
             rad2 = math.radians(self.angle)
             sx = self.x + math.cos(rad2) * (self.radius + 5)
             sy = self.y + math.sin(rad2) * (self.radius + 5)
-            env.projectiles.append(Projectile(sx, sy, self.angle, owner=self, damage=env.enemy_damage if self.team.startswith("enemy") else env.bullet_damage))
+            
+            wp = self.active_weapon
+            dmg = env.enemy_damage if self.team.startswith("enemy") else (wp.damage if wp else env.bullet_damage)
+            
+            env.projectiles.append(Projectile(sx, sy, self.angle, owner=self, damage=dmg, weapon_spec=wp))
             if self.infinite_ammo:
                 fire_rate = float(getattr(env.stage_spec, "enemy_fire_rate", 0.0))
                 self.attack_cooldown = max(1, int(FPS / fire_rate)) if fire_rate > 0 else 15

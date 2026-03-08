@@ -40,7 +40,7 @@ from game.npc import enemy_actions, teammate_actions
 
 # ─── 常數 ────────────────────────────────────────────
 NUM_CHANNELS = 6
-NUM_SCALARS = 22
+NUM_SCALARS = 24
 
 # 散彈槍彈片角度偏移
 _SHOTGUN_OFFSETS = [-30.0, -15.0, 0.0, 15.0, 30.0]
@@ -390,7 +390,8 @@ class GameEnv:
             if dt <= VIEW_RANGE and abs(ang) <= HALF_FOV and self.has_line_of_sight(ax, ay, other.x, other.y):
                 dr = (ft + rt) / 1.41421356
                 dc = (ft - rt) / 1.41421356
-                val = other.hp / 200.0
+                # 倒地單位使用 -1.0，讓神經網路能清楚區分「倒地」與「殘血」
+                val = -1.0 if other.is_downed() else other.hp / 200.0
                 self._inject_value(view[1], VIEW_CENTER + dr, VIEW_CENTER + dc, val)
 
         # Ch2: 隊友雷達（team_id 相同、全域可見）
@@ -405,7 +406,8 @@ class GameEnv:
             dc = (mft - mrt) / 1.41421356
             r_f = np.clip(VIEW_CENTER + dr, 0.0, VIEW_SIZE - 1.001)
             c_f = np.clip(VIEW_CENTER + dc, 0.0, VIEW_SIZE - 1.001)
-            val = other.hp / 200.0
+            # 倒地的隊友使用 -1.0，讓神經網路知道需要去救援
+            val = -1.0 if other.is_downed() else other.hp / 200.0
             self._inject_value(view[2], r_f, c_f, val)
 
         # Ch3: 威脅/彈道熱力圖
@@ -459,7 +461,7 @@ class GameEnv:
         else:
             view[5] = 1.0
 
-        # ── 22 純量 ──
+        # ── 24 純量 ──
         # weapon one-hot
         def _weapon_onehot(slot_idx):
             oh = [0.0] * 5
@@ -510,11 +512,16 @@ class GameEnv:
             norm_ft = float(np.clip(cft / COLS, -1.0, 1.0))
             norm_rt = float(np.clip(crt / ROWS, -1.0, 1.0))
 
+        # 新增 2 個純量：倒地狀態 Flag & 救援進度
+        is_downed_f = 1.0 if agent.is_downed() else 0.0
+        revive_ratio = agent.revive_progress / max(1, agent.revive_frames) if agent.is_downed() else 0.0
+
         scalars = np.array(
             w1_oh + w2_oh + [
                 active_slot_f, ammo_ratio, reload_ratio, heal_ratio,
                 hp_ratio, medkit_ratio, grenade_ratio, dash_ratio,
                 hit_marker, norm_ft, norm_rt, has_ally,
+                is_downed_f, revive_ratio,
             ],
             dtype=np.float32,
         )
@@ -682,7 +689,7 @@ class GameEnv:
                 continue
             did_shoot, dash_reward = self._apply_learning_action(agent, action_12)
             if did_shoot:
-                rewards[i] -= 0.02  # SHOOT_PENALTY
+                rewards[i] -= GameConfig.SHOOT_PENALTY
             rewards[i] += dash_reward
 
         # Teammate NPC 動作
@@ -721,14 +728,14 @@ class GameEnv:
                     break
             revived = agent.tick_revive(rescuer_nearby)
             if revived:
-                rewards[i] += 3.0   # 被救者獎勵（降低，避免過大）
+                rewards[i] += GameConfig.BE_REVIVED_REWARD
                 # 找最近的同隊友給救援獎勵
                 for j, rescuer in enumerate(self.learning_agents):
                     if j == i or rescuer.truly_dead() or rescuer.is_downed():
                         continue
                     if rescuer.team_id == agent.team_id:
                         if math.hypot(rescuer.x - agent.x, rescuer.y - agent.y) <= TILE_SIZE:
-                            rewards[j] += 5.0   # 救人者獎勵
+                            rewards[j] += GameConfig.REVIVE_REWARD
                             break
 
         # 清理過期聲音波紋（使用 frame-based alive 判定）
@@ -745,7 +752,7 @@ class GameEnv:
             best_angle = 180.0
 
             for other in self.all_agents:
-                if not other.alive() or other.team_id == agent.team_id:
+                if not other.alive() or other.team_id == agent.team_id or other.is_downed():
                     continue
                 dx = other.x - agent.x
                 dy = other.y - agent.y
@@ -784,7 +791,7 @@ class GameEnv:
                 if other is agent or not other.alive() or other.team_id == agent.team_id:
                     continue
                 if math.hypot(agent.x - other.x, agent.y - other.y) < agent.radius + other.radius + 1:
-                    rewards[i] -= 0.005
+                    rewards[i] -= GameConfig.COLLISION_PENALTY
 
         # 子彈碰撞
         for p in self.projectiles[:]:
@@ -808,15 +815,15 @@ class GameEnv:
                     # 獎勵 / 懲罰
                     for i, la in enumerate(self.learning_agents):
                         if ag is la:
-                            rewards[i] -= 1.0  # DAMAGE_PENALTY
+                            rewards[i] -= GameConfig.DAMAGE_PENALTY_COEF * p.damage
                         if p.owner is la and ag.team_id != la.team_id:
                             # 打到已倒地目標：不給擊中獎勵
                             if not was_downed_before:
-                                rewards[i] += 1.0  # HIT_REWARD（只有打到站立目標才給）
+                                rewards[i] += GameConfig.HIT_REWARD_COEF * p.damage
                                 la.hit_marker_timer = 3
                             # 剛把目標打倒地：擊倒獎勵
                             if just_downed:
-                                rewards[i] += 10.0  # DOWN_REWARD
+                                rewards[i] += GameConfig.DOWN_REWARD
                     if p in self.projectiles:
                         self.projectiles.remove(p)
                     hit_someone = True
@@ -859,10 +866,10 @@ class GameEnv:
                         # learning agent 獎勵
                         for i, la in enumerate(self.learning_agents):
                             if ag is la:
-                                rewards[i] -= GameConfig.DAMAGE_PENALTY
+                                rewards[i] -= GameConfig.DAMAGE_PENALTY_COEF * dmg
                             if g.owner is la and ag.team_id != la.team_id:
                                 if not was_downed_before:
-                                    rewards[i] += GameConfig.HIT_REWARD
+                                    rewards[i] += GameConfig.HIT_REWARD_COEF * dmg
                                 if just_downed:
                                     rewards[i] += GameConfig.DOWN_REWARD
                 if g in self.grenades_list:
@@ -981,7 +988,7 @@ class GameEnv:
         final_rewards = [GameConfig.INDIVIDUAL_REWARD_WEIGHT * rewards[i] + GameConfig.TEAM_REWARD_WEIGHT * team_reward
                          for i in range(len(self.learning_agents))]
 
-        standing_enemy_cnt = sum(1 for e in self.enemy_agents if not e.is_downed() and not e.truly_dead())
+        downed_or_dead_cnt = sum(1 for e in self.enemy_agents if e.is_downed() or e.truly_dead())
         info = {
             "stage_id": self.stage_id,
             "stage_name": self.stage_spec.name,
@@ -991,7 +998,7 @@ class GameEnv:
             "enemy_alive_count": alive_enemy_cnt,
             "ally_alive_count": len([a for a in self.team_agents if a.alive()]),
             "ai_kill_target": ai_win,
-            "down_count": self.stage_spec.enemy_count - standing_enemy_cnt,
+            "down_count": downed_or_dead_cnt,
             "action_masks": [a.get_action_mask() for a in self.learning_agents],
         }
         self._last_info = info
@@ -1030,9 +1037,14 @@ class GameEnv:
 
     def _draw_agent(self, a):
         if a.is_downed():
-            # 倒地：縮小的半透明灰色圓圈
-            downed_color = (130, 130, 130)
+            # 倒地：縮小但保留原本顏色的半透明感，外加明顯的紅色打叉，避免使用者以為模型消失了
+            downed_color = (max(0, a.color[0]-100), max(0, a.color[1]-100), max(0, a.color[2]-100))
             pygame.draw.circle(self.screen, downed_color, (int(a.x), int(a.y)), a.radius // 2)
+            pygame.draw.circle(self.screen, (255, 50, 50), (int(a.x), int(a.y)), a.radius // 2, 2)
+            # 畫個紅叉
+            r = a.radius // 2
+            pygame.draw.line(self.screen, (255, 50, 50), (int(a.x) - r, int(a.y) - r), (int(a.x) + r, int(a.y) + r), 2)
+            pygame.draw.line(self.screen, (255, 50, 50), (int(a.x) - r, int(a.y) + r), (int(a.x) + r, int(a.y) - r), 2)
             # 救援進度條
             if a.revive_progress > 0:
                 bar_w = a.radius * 2

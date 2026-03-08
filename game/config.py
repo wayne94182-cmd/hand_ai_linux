@@ -30,9 +30,9 @@ class GameConfig:
     INDIVIDUAL_REWARD_WEIGHT = 0.6
     TEAM_REWARD_WEIGHT = 0.4
 
-    HIT_REWARD = 2.0
+    HIT_REWARD_COEF = 0.05
     DOWN_REWARD = 10.0
-    DAMAGE_PENALTY = 1.0
+    DAMAGE_PENALTY_COEF = 0.05
     WIN_REWARD = 10.0
     LOSE_PENALTY = 5.0
 
@@ -41,9 +41,10 @@ class GameConfig:
     COLLISION_PENALTY = 0.005
 
     aim_reward = 0.02
-    NPC_KILL_REWARD = 15.0
+    NPC_KILL_REWARD = 10.0
     ALIVE_NPC_PENALTY = 5.0
-    RADAR_REWARD = 0.005
+    BE_REVIVED_REWARD = 3.0
+    REVIVE_REWARD = 5.0
 
 
 @dataclass(frozen=True)
@@ -92,10 +93,10 @@ STAGE_SPECS = {
     # Stage 1：打靶期｜雙人、開局有武器需撿彈匣、木樁、小地圖
     1: StageSpec(
         stage_id=1, name="打靶期", mode="scripted",
-        enemy_hp=100, enemy_damage=0, bullet_damage=40,
+        enemy_hp=100, enemy_damage=0, bullet_damage=35,
         enemy_fire_rate=0.0, enemy_spread_deg=0.0,
         enemy_can_shoot=False, enemy_mobile=False,
-        teammate_count=1, enemy_count=3,
+        teammate_count=0, enemy_count=3,
         max_frames=1200,
         move_noise_pct=0.05, rotation_noise_pct=0.05,
         infinite_ammo=False,
@@ -107,10 +108,10 @@ STAGE_SPECS = {
     # Stage 2：追獵期｜雙人、逃跑NPC、需預判瞄準、中型地圖
     2: StageSpec(
         stage_id=2, name="追獵期", mode="scripted",
-        enemy_hp=100, enemy_damage=0, bullet_damage=30,
+        enemy_hp=100, enemy_damage=0, bullet_damage=25,
         enemy_fire_rate=0.0, enemy_spread_deg=0.0,
         enemy_can_shoot=False, enemy_mobile=True,
-        teammate_count=1, enemy_count=3,
+        teammate_count=0, enemy_count=3,
         max_frames=1500,
         move_noise_pct=0.05, rotation_noise_pct=0.05,
         infinite_ammo=False,
@@ -125,7 +126,7 @@ STAGE_SPECS = {
         enemy_hp=100, enemy_damage=20, bullet_damage=20,
         enemy_fire_rate=2.0, enemy_spread_deg=22.5,
         enemy_can_shoot=True, enemy_mobile=True,
-        teammate_count=1, enemy_count=3,
+        teammate_count=0, enemy_count=3,
         max_frames=1500,
         move_noise_pct=0.08, rotation_noise_pct=0.08,
         infinite_ammo=False,
@@ -140,7 +141,7 @@ STAGE_SPECS = {
         enemy_hp=150, enemy_damage=20, bullet_damage=20,
         enemy_fire_rate=4.0, enemy_spread_deg=20.0,
         enemy_can_shoot=True, enemy_mobile=True,
-        teammate_count=2, enemy_count=4,
+        teammate_count=0, enemy_count=4,
         max_frames=5400,
         move_noise_pct=0.10, rotation_noise_pct=0.10,
         infinite_ammo=False,
@@ -155,7 +156,7 @@ STAGE_SPECS = {
         enemy_hp=100, enemy_damage=20, bullet_damage=20,
         enemy_fire_rate=0.0, enemy_spread_deg=0.0,
         enemy_can_shoot=True, enemy_mobile=True,
-        teammate_count=2, enemy_count=3,
+        teammate_count=0, enemy_count=3,
         max_frames=5400,
         move_noise_pct=0.12, rotation_noise_pct=0.12,
         infinite_ammo=False,
@@ -170,7 +171,7 @@ STAGE_SPECS = {
         enemy_hp=120, enemy_damage=20, bullet_damage=20,
         enemy_fire_rate=3.0, enemy_spread_deg=15.0,
         enemy_can_shoot=True, enemy_mobile=True,
-        teammate_count=2, enemy_count=3,
+        teammate_count=0, enemy_count=3,
         max_frames=5400,
         move_noise_pct=0.15, rotation_noise_pct=0.15,
         infinite_ammo=False,

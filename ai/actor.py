@@ -14,7 +14,7 @@ HIDDEN_SIZE = 256
 NUM_ACTIONS_DISCRETE = 12   # Bernoulli 動作
 NUM_COMM = 4                # 連續通訊向量維度
 IN_CHANNELS = 6
-NUM_SCALARS = 22
+NUM_SCALARS = 24
 
 
 class ConvLSTM(nn.Module):
