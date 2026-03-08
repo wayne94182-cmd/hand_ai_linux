@@ -981,6 +981,7 @@ class GameEnv:
         final_rewards = [GameConfig.INDIVIDUAL_REWARD_WEIGHT * rewards[i] + GameConfig.TEAM_REWARD_WEIGHT * team_reward
                          for i in range(len(self.learning_agents))]
 
+        standing_enemy_cnt = sum(1 for e in self.enemy_agents if not e.is_downed() and not e.truly_dead())
         info = {
             "stage_id": self.stage_id,
             "stage_name": self.stage_spec.name,
@@ -990,7 +991,7 @@ class GameEnv:
             "enemy_alive_count": alive_enemy_cnt,
             "ally_alive_count": len([a for a in self.team_agents if a.alive()]),
             "ai_kill_target": ai_win,
-            "down_count": self.stage_spec.enemy_count - alive_enemy_cnt,
+            "down_count": self.stage_spec.enemy_count - standing_enemy_cnt,
             "action_masks": [a.get_action_mask() for a in self.learning_agents],
         }
         self._last_info = info
