@@ -28,8 +28,8 @@ PISTOL = WeaponSpec(
     spread_deg=2.0, heatmap_value=0.2
 )
 RIFLE = WeaponSpec(
-    name="rifle", damage=20, mag_size=15,
-    reload_frames=150, fire_cooldown=8,
+    name="rifle", damage=15, mag_size=20,
+    reload_frames=150, fire_cooldown=12,
     bullet_speed=22.0, bullet_life=28,
     spread_deg=5.0, heatmap_value=0.5
 )
@@ -59,7 +59,7 @@ class GroundItem:
     """地面上可撿取的道具"""
     x: float
     y: float
-    item_type: str          # "weapon", "medkit", "grenade"
+    item_type: str          # "weapon", "medkit", "grenade", "ammo"
     weapon_spec: Optional[WeaponSpec] = None  # item_type=="weapon" 時有效
 
 
@@ -102,6 +102,13 @@ def try_auto_pickup(agent, ground_items: list, pickup_radius: float = 40.0) -> l
         elif item.item_type == "grenade":
             if agent.grenades < agent.max_grenades:
                 agent.grenades += 1
+                picked_up.append(item)
+
+        elif item.item_type == "ammo":
+            if not hasattr(agent, 'ammo_boxes'):    agent.ammo_boxes = 0
+            if not hasattr(agent, 'max_ammo_boxes'): agent.max_ammo_boxes = 12
+            if agent.ammo_boxes < agent.max_ammo_boxes:
+                agent.ammo_boxes += 1
                 picked_up.append(item)
 
     # 從原列表中移除已拾取的項目

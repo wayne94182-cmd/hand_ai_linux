@@ -94,7 +94,7 @@ DEFAULT_SPEED_IDX = 2
 CELL = 8
 PAD = 8
 LABEL_H = 20
-CH_NAMES = ["地形", "敵人", "隊友", "威脅", "聲音", "安全區", "武器", "醫療包", "手榴彈"]
+CH_NAMES = ["地形", "敵人", "隊友", "威脅", "聲音", "安全區", "武器", "醫療包", "手榴彈", "彈藥"]
 
 
 def parse_model_path(ckpt: str) -> str:
@@ -312,7 +312,8 @@ def watch_ai(ckpt: str, stage_id: int,
         if ai.active_weapon:
             wp_name = ai.active_weapon.name
         hud1 = (f"Stage {stage_id}  {stage_spec.name}  |"
-                f"  HP:{ai.hp}  Ammo:{ai.ammo}  Weapon:{wp_name}")
+                f"  HP:{ai.hp}  Ammo:{ai.ammo}  Weapon:{wp_name}"
+                f"  AmmoBox:{ai.ammo_boxes}")
         hud2 = (f"EnemyAlive:{len(env._alive_enemies())}"
                 f"  AllyAlive:{len([x for x in env.team_agents if x.alive()])}")
         screen.blit(font.render(hud1, True, (255, 255, 255)), (10, 8))

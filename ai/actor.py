@@ -12,18 +12,18 @@ from torch.distributions import Bernoulli, Normal
 from torch.utils.checkpoint import checkpoint as gradient_checkpoint
 
 HIDDEN_SIZE = 256
-NUM_ACTIONS_DISCRETE = 12   # Bernoulli 動作
+NUM_ACTIONS_DISCRETE = 16   # Bernoulli 動作
 NUM_COMM = 4                # 連續通訊向量維度
-IN_CHANNELS = 9
-NUM_SCALARS = 24
+IN_CHANNELS = 10
+NUM_SCALARS = 25
 
 
 class ConvLSTM(nn.Module):
     """
     CNN + LSTM Actor，支援：
-    1. 9 通道輸入（地形/敵人/隊友/威脅/聲音/安全區/武器/醫療包/手榴彈）
+    1. 10 通道輸入（地形/敵人/隊友/威脅/聲音/安全區/武器/醫療包/手榴彈/彈藥）
     2. LSTM 雙狀態 (h, c)
-    3. 12 個離散動作（Bernoulli）
+    3. 16 個離散動作（Bernoulli）
     4. 4 維連續通訊向量（Normal distribution）
     5. Cross-Attention 接收隊友通訊
     6. seq_mode=True 一次處理整條時間序列
@@ -129,7 +129,7 @@ class ConvLSTM(nn.Module):
           comm_in: (B, K, num_comm) 或 None
           hidden:  (h, c) 各 (1, B, hidden_size) 或 None
           回傳:
-            logits:      (B, 12)
+            logits:      (B, 16)
             comm_mu:     (B, 4)
             comm_logstd: (B, 4)
             feat:        (B, 256)
@@ -141,7 +141,7 @@ class ConvLSTM(nn.Module):
           comm_in: (T, B, K, num_comm) 或 None
           hidden:  (h, c) 各 (1, B, hidden_size) 或 None
           回傳:
-            logits:      (T, B, 12)
+            logits:      (T, B, 16)
             comm_mu:     (T, B, 4)
             comm_logstd: (T, B, 4)
             feat:        (T, B, 256)
@@ -266,7 +266,7 @@ class ConvLSTM(nn.Module):
         """
         推理用輔助函式（與原 get_action 相容）
         state: (view np.ndarray, scalars np.ndarray)
-        回傳: (actions_list[12], comm_vec[4], new_hidden)
+        回傳: (actions_list[16], comm_vec[4], new_hidden)
         """
         device = next(self.parameters()).device
         view, scalars = state

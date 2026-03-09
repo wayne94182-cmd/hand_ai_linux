@@ -39,13 +39,13 @@ from game.audio import (
 from game.npc import enemy_actions, teammate_actions
 
 # ─── 常數 ────────────────────────────────────────────
-NUM_CHANNELS = 9
-NUM_SCALARS = 24
+NUM_CHANNELS = 10
+NUM_SCALARS = 25
 
 
 # 道具生成權重
-_WEAPON_WEIGHTS = [0.3, 0.4, 0.2, 0.1]  # PISTOL, RIFLE, SHOTGUN, SNIPER
-_ITEM_TYPE_WEIGHTS = [0.5, 0.3, 0.2]     # weapon, medkit, grenade
+_WEAPON_WEIGHTS = [0.2, 0.35, 0.30, 0.15]       # PISTOL, RIFLE, SHOTGUN, SNIPER
+_ITEM_TYPE_WEIGHTS = [0.30, 0.15, 0.15, 0.40] # weapon, medkit, grenade, ammo
 
 _MAP_POOL = {"small": SMALL_MAPS, "medium": MEDIUM_MAPS, "large": LARGE_MAPS}
 
@@ -227,14 +227,20 @@ class GameEnv:
             for _ in range(n_items):
                 spot = random.choice(empty_spots)
                 roll = random.random()
-                if roll < _ITEM_TYPE_WEIGHTS[0]:
-                    # 武器
-                    wp = random.choices(WEAPON_TYPES, weights=_WEAPON_WEIGHTS, k=1)[0]
-                    self.ground_items.append(GroundItem(float(spot[0]), float(spot[1]), "weapon", weapon_spec=wp))
-                elif roll < _ITEM_TYPE_WEIGHTS[0] + _ITEM_TYPE_WEIGHTS[1]:
-                    self.ground_items.append(GroundItem(float(spot[0]), float(spot[1]), "medkit"))
-                else:
-                    self.ground_items.append(GroundItem(float(spot[0]), float(spot[1]), "grenade"))
+                cum = 0.0
+                item = None
+                for weight, factory in [
+                    (_ITEM_TYPE_WEIGHTS[0], lambda s=spot: GroundItem(float(s[0]), float(s[1]), "weapon", weapon_spec=random.choices(WEAPON_TYPES, weights=_WEAPON_WEIGHTS, k=1)[0])),
+                    (_ITEM_TYPE_WEIGHTS[1], lambda s=spot: GroundItem(float(s[0]), float(s[1]), "medkit")),
+                    (_ITEM_TYPE_WEIGHTS[2], lambda s=spot: GroundItem(float(s[0]), float(s[1]), "grenade")),
+                    (_ITEM_TYPE_WEIGHTS[3], lambda s=spot: GroundItem(float(s[0]), float(s[1]), "ammo")),
+                ]:
+                    cum += weight
+                    if roll < cum:
+                        item = factory()
+                        break
+                if item:
+                    self.ground_items.append(item)
 
         # 毒圈初始化
         if self.stage_spec.has_poison_zone:
@@ -469,7 +475,7 @@ class GameEnv:
         else:
             view[5] = 1.0
 
-        # Ch6: 武器, Ch7: 醫療包, Ch8: 手榴彈（地面道具雷達）
+        # Ch6: 武器, Ch7: 醫療包, Ch8: 手榴彈, Ch9: 彈藥（地面道具雷達）
         for item in self.ground_items:
             dx = item.x - ax
             dy = item.y - ay
@@ -486,6 +492,8 @@ class GameEnv:
                     self._inject_value(view[7], VIEW_CENTER + dr, VIEW_CENTER + dc, 1.0)
                 elif item.item_type == "grenade":
                     self._inject_value(view[8], VIEW_CENTER + dr, VIEW_CENTER + dc, 1.0)
+                elif item.item_type == "ammo":
+                    self._inject_value(view[9], VIEW_CENTER + dr, VIEW_CENTER + dc, 1.0)
 
         # ── 24 純量 ──
         # weapon one-hot
@@ -548,6 +556,7 @@ class GameEnv:
                 hp_ratio, medkit_ratio, grenade_ratio, dash_ratio,
                 hit_marker, norm_ft, norm_rt, has_ally,
                 is_downed_f, revive_ratio,
+                agent.ammo_boxes / max(1, agent.max_ammo_boxes),  # 第 25 個純量：備彈比例
             ],
             dtype=np.float32,
         )
@@ -570,15 +579,15 @@ class GameEnv:
     #  核心步進
     # ═══════════════════════════════════════════════════════
 
-    def _apply_learning_action(self, agent, action_12):
+    def _apply_learning_action(self, agent, action_16):
         """
-        處理一個 learning agent 的 12 維動作，
+        處理一個 learning agent 的 16 維動作，
         回傳 (did_shoot: bool, dash_reward: float)。
         """
         mask = agent.get_action_mask()
         # 遮罩過濾
-        act = [action_12[i] if (i < len(action_12) and mask[i]) else 0.0
-               for i in range(12)]
+        act = [action_16[i] if (i < len(action_16) and mask[i]) else 0.0
+               for i in range(16)]
 
         # 打藥讀條與取消
         if act[9] > 0.5:
@@ -592,7 +601,7 @@ class GameEnv:
             agent.tick_heal()
 
         # 換彈讀條（自動：無彈時自動開始）
-        if agent.ammo == 0 and agent.reload_progress == 0 and not agent.infinite_ammo:
+        if agent.ammo == 0 and agent.reload_progress == 0:
             agent.start_reload()
         if agent.reload_progress > 0:
             agent.tick_reload()
@@ -623,6 +632,31 @@ class GameEnv:
         if did_shoot:
             self.sound_waves.append(create_gunshot_wave(agent.x, agent.y, self.frame_count))
 
+        # 丟棄物資（動作 12~15）
+        drop_rad = math.radians(agent.angle)
+        drop_x = agent.x + math.cos(drop_rad) * 45
+        drop_y = agent.y + math.sin(drop_rad) * 45
+
+        if act[12] > 0.5 and len(agent.weapon_slots) > 1:
+            wp_to_drop = agent.weapon_slots.pop(agent.active_slot)
+            self.ground_items.append(GroundItem(drop_x, drop_y, "weapon", weapon_spec=wp_to_drop))
+            agent.active_slot = 0
+            if agent.weapon_slots:
+                new_wp = agent.weapon_slots[0]
+                agent.max_ammo = new_wp.mag_size
+                agent.reload_delay = new_wp.reload_frames
+                agent.ammo = min(agent.ammo, agent.max_ammo)
+            agent.reload_progress = 0
+        if act[13] > 0.5 and agent.medkits > 0:
+            agent.medkits -= 1
+            self.ground_items.append(GroundItem(drop_x, drop_y, "medkit"))
+        if act[14] > 0.5 and agent.grenades > 0:
+            agent.grenades -= 1
+            self.ground_items.append(GroundItem(drop_x, drop_y, "grenade"))
+        if act[15] > 0.5 and agent.ammo_boxes > 0:
+            agent.ammo_boxes -= 1
+            self.ground_items.append(GroundItem(drop_x, drop_y, "ammo"))
+
         return did_shoot, dash_reward
 
     def _single_step(self, ai_actions_list, enemy_ai_action=None):
@@ -647,11 +681,11 @@ class GameEnv:
         for i, agent in enumerate(self.learning_agents):
             if agent.truly_dead():
                 continue
-            action_12 = ai_actions_list[i] if i < len(ai_actions_list) else [0.0] * 12
+            action_16 = ai_actions_list[i] if i < len(ai_actions_list) else [0.0] * 16
             if agent.is_downed():
                 # 倒地中只會執行移動，不處理戰鬥動作
                 mask = agent.get_action_mask()
-                act = [action_12[k] if mask[k] else 0.0 for k in range(12)]
+                act = [action_16[k] if mask[k] else 0.0 for k in range(16)]
                 rad_a = math.radians(agent.angle)
                 fx, fy = math.cos(rad_a), math.sin(rad_a)
                 rx, ry = math.cos(rad_a + math.pi / 2), math.sin(rad_a + math.pi / 2)
@@ -663,7 +697,7 @@ class GameEnv:
                 dy += ry * agent.speed * agent.downed_speed_ratio * right_in
                 self.try_move_agent(agent, dx, dy)
                 continue
-            did_shoot, dash_reward = self._apply_learning_action(agent, action_12)
+            did_shoot, dash_reward = self._apply_learning_action(agent, action_16)
             if did_shoot:
                 rewards[i] -= GameConfig.SHOOT_PENALTY
             rewards[i] += dash_reward
@@ -1008,8 +1042,8 @@ class GameEnv:
 
     def step(self, ai_actions, enemy_ai_action=None, frame_skip=1):
         """
-        ai_actions: List[List[float]] 長度 n_learning_agents，每個長度 12
-                    向後相容：單一 List[float]（長度 12）包裝成 [ai_actions]
+        ai_actions: List[List[float]] 長度 n_learning_agents，每個長度 16
+                    向後相容：單一 List[float]（長度 16）包裝成 [ai_actions]
         """
         # 向後相容：單一動作包裝成 list
         if ai_actions and not isinstance(ai_actions[0], (list, tuple)):

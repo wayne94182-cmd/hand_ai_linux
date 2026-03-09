@@ -25,6 +25,10 @@ def play_game(stage_id: int, n_ai: int = 1, max_frames: int = 5400, weapon_name:
     print("  Tab / 2      : 切換武器 (Switch Weapon)")
     print("  H / 3        : 使用醫療包 (Use Medkit)")
     print("  G / 4        : 投擲手榴彈 (Throw Grenade)")
+    print("  Z            : 丟棄武器 (Drop Weapon)")
+    print("  X            : 丟棄醫療包 (Drop Medkit)")
+    print("  C            : 丟棄手榴彈 (Drop Grenade)")
+    print("  V            : 丟棄彈藥箱 (Drop Ammo)")
     print("  [Esc]        : 離開")
 
     pygame.init()
@@ -111,7 +115,8 @@ def play_game(stage_id: int, n_ai: int = 1, max_frames: int = 5400, weapon_name:
             wp_name = ai.active_weapon.name
         
         hud1 = (f"Stage {stage_id} {stage_spec.name} | "
-                f"HP:{int(ai.hp)}/{int(ai.max_hp)}  Ammo:{ai.ammo}  Wt:{wp_name}")
+                f"HP:{int(ai.hp)}/{int(ai.max_hp)}  Ammo:{ai.ammo}  Wt:{wp_name}"
+                f"  AmmoBox:{ai.ammo_boxes}")
         hud2 = (f"Medkit:{ai.medkits}  Grenade:{ai.grenades} | "
                 f"Enemy:{len(env._alive_enemies())}  Ally:{len([x for x in env.team_agents if x.alive()])}")
         
@@ -143,6 +148,10 @@ def play_game(stage_id: int, n_ai: int = 1, max_frames: int = 5400, weapon_name:
     action_throw_grenade = 0.0
     action_switch_weapon = 0.0
     action_use_medkit = 0.0
+    action_drop_weapon = 0.0
+    action_drop_medkit = 0.0
+    action_drop_grenade = 0.0
+    action_drop_ammo = 0.0
 
     while True:
         for event in pygame.event.get():
@@ -163,6 +172,14 @@ def play_game(stage_id: int, n_ai: int = 1, max_frames: int = 5400, weapon_name:
                     action_switch_weapon = 1.0
                 elif event.key in (pygame.K_h, pygame.K_3):
                     action_use_medkit = 1.0
+                elif event.key == pygame.K_z:
+                    action_drop_weapon = 1.0
+                elif event.key == pygame.K_x:
+                    action_drop_medkit = 1.0
+                elif event.key == pygame.K_c:
+                    action_drop_grenade = 1.0
+                elif event.key == pygame.K_v:
+                    action_drop_ammo = 1.0
         
         if paused or done:
             draw_frame()
@@ -194,8 +211,10 @@ def play_game(stage_id: int, n_ai: int = 1, max_frames: int = 5400, weapon_name:
         # 0=up, 1=down, 2=left, 3=right,
         # 4=cw, 5=ccw, 6=attack, 7=dash,
         # 8=switch_weapon, 9=use_medkit,
-        # 10=throw_grenade, 11=focus
-        act = [0.0] * 12
+        # 10=throw_grenade, 11=focus,
+        # 12=drop_weapon, 13=drop_medkit,
+        # 14=drop_grenade, 15=drop_ammo
+        act = [0.0] * 16
         if keys[pygame.K_w]: act[0] = 1.0
         if keys[pygame.K_s]: act[1] = 1.0
         if keys[pygame.K_a]: act[2] = 1.0
@@ -221,11 +240,24 @@ def play_game(stage_id: int, n_ai: int = 1, max_frames: int = 5400, weapon_name:
             
         if keys[pygame.K_LCTRL] or keys[pygame.K_RCTRL]: act[11] = 1.0
 
+        if action_drop_weapon > 0:
+            act[12] = 1.0
+            action_drop_weapon = 0.0
+        if action_drop_medkit > 0:
+            act[13] = 1.0
+            action_drop_medkit = 0.0
+        if action_drop_grenade > 0:
+            act[14] = 1.0
+            action_drop_grenade = 0.0
+        if action_drop_ammo > 0:
+            act[15] = 1.0
+            action_drop_ammo = 0.0
+
         # 將玩家動作放進 actions list
         actions = [act]
         # 如果有多個 AI 槽位，其他則送空動作 (全0) 讓他們發呆
         for _ in range(n_ai - 1):
-            actions.append([0.0] * 12)
+            actions.append([0.0] * 16)
 
         # 這裡的 step 會根據 n_ai 數量返回對應格式
         result = env.step(actions, frame_skip=1)

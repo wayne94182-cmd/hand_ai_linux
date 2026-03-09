@@ -71,6 +71,8 @@ class Agent:
         self.max_medkits: int = 5
         self.grenades: int = 0
         self.max_grenades: int = 2
+        self.ammo_boxes: int = 3
+        self.max_ammo_boxes: int = 5
 
         # 讀條狀態
         self.reload_progress: int = 0  # 當前換彈已累積幀數（0 = 未換彈）
@@ -122,7 +124,7 @@ class Agent:
             self.hit_marker_timer -= 1
 
     def _reload_tick(self):
-        if not self.infinite_ammo and self.ammo == 0:
+        if self.ammo == 0:
             self.reload_timer += 1
             if self.reload_timer >= self.reload_delay:
                 self.ammo = self.max_ammo
@@ -196,7 +198,7 @@ class Agent:
         env.try_move_agent(self, dx, dy)
         self._reload_tick()
 
-        can_shoot = atk > 0.5 and self.attack_cooldown == 0 and (self.ammo > 0 or self.infinite_ammo)
+        can_shoot = atk > 0.5 and self.attack_cooldown == 0 and self.ammo > 0
         did_shoot = False
         if can_shoot:
             rad2 = math.radians(self.angle)
@@ -220,9 +222,8 @@ class Agent:
                 self.attack_cooldown = max(1, int(FPS / fire_rate)) if fire_rate > 0 else 15
             else:
                 self.attack_cooldown = 15
-                
-            if not self.infinite_ammo:
-                self.ammo -= 1
+
+            self.ammo -= 1
             did_shoot = True
 
         return did_shoot, dash_reward
@@ -231,18 +232,20 @@ class Agent:
 
     def get_action_mask(self) -> list:
         """
-        回傳長度 12 的 bool list，True = 此動作允許執行。
+        回傳長度 16 的 bool list，True = 此動作允許執行。
         索引對應：
           0=up, 1=down, 2=left, 3=right,
           4=cw, 5=ccw, 6=attack, 7=dash,
           8=switch_weapon, 9=use_medkit,
-          10=throw_grenade, 11=focus
+          10=throw_grenade, 11=focus,
+          12=drop_weapon, 13=drop_medkit,
+          14=drop_grenade, 15=drop_ammo
         """
-        mask = [True] * 12
+        mask = [True] * 16
 
         # 倒地中：只允許移動（緩慢爬行），禁止一切戰鬥動作
         if self.downed:
-            for i in range(12):
+            for i in range(16):
                 if i not in (0, 1, 2, 3):   # 只保留 up/down/left/right
                     mask[i] = False
             return mask
@@ -254,7 +257,7 @@ class Agent:
 
         # 打藥中：只允許轉向 (cw=4, ccw=5) 與取消打藥 (use_medkit=9)
         if self.heal_progress > 0:
-            for i in range(12):
+            for i in range(16):
                 if i not in (4, 5, 9):
                     mask[i] = False
 
@@ -277,6 +280,12 @@ class Agent:
         # 只有一把武器或沒有武器：禁止 switch_weapon(8)
         if len(self.weapon_slots) < 2:
             mask[8] = False
+
+        # 新增 12~15 丟棄限制
+        if len(self.weapon_slots) <= 1: mask[12] = False
+        if self.medkits <= 0:           mask[13] = False
+        if self.grenades <= 0:          mask[14] = False
+        if self.ammo_boxes <= 0:        mask[15] = False
 
         return mask
 
@@ -304,6 +313,8 @@ class Agent:
             return  # 已經在換彈中
         if self.ammo >= self.max_ammo:
             return  # 滿彈匣不需要換
+        if not self.infinite_ammo and self.ammo_boxes <= 0:
+            return  # 備彈耗盡且非無限備彈，禁止換彈
         self.reload_progress = 1
 
     def tick_reload(self) -> bool:
@@ -315,6 +326,8 @@ class Agent:
         self.reload_progress += 1
         if self.reload_progress >= required:
             self.ammo = self.max_ammo
+            if not self.infinite_ammo:
+                self.ammo_boxes -= 1
             self.reload_progress = 0
             self.reload_timer = 0
             return True
