@@ -1071,11 +1071,13 @@ class GameEnv:
         view_r = float(VIEW_RANGE)
         half_fov_val = HALF_FOV
         fov_degrees_val = FOV_DEGREES
+        tile_size_val = float(TILE_SIZE)
         if a.active_weapon and getattr(a.active_weapon, 'name', '') == 'sniper':
-            from game.fov import SNIPER_VIEW_RANGE, SNIPER_HALF_FOV, SNIPER_FOV_DEGREES
+            from game.fov import SNIPER_VIEW_RANGE, SNIPER_HALF_FOV, SNIPER_FOV_DEGREES, SNIPER_TILE_SIZE
             view_r = float(SNIPER_VIEW_RANGE)
             half_fov_val = float(SNIPER_HALF_FOV)
             fov_degrees_val = float(SNIPER_FOV_DEGREES)
+            tile_size_val = float(SNIPER_TILE_SIZE)
 
         pts = [(a.x, a.y)]
         steps = 60
@@ -1086,8 +1088,8 @@ class GameEnv:
             sin_rel = math.sin(rad_rel)
             ft_val = view_r * cos_rel
             rt_val = view_r * sin_rel
-            wx = a.x + (fwd_x * ft_val + rgt_x * rt_val) * TILE_SIZE
-            wy = a.y + (fwd_y * ft_val + rgt_y * rt_val) * TILE_SIZE
+            wx = a.x + (fwd_x * ft_val + rgt_x * rt_val) * tile_size_val
+            wy = a.y + (fwd_y * ft_val + rgt_y * rt_val) * tile_size_val
             pts.append((wx, wy))
 
         pts.append((a.x, a.y))

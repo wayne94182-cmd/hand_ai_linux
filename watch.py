@@ -494,11 +494,13 @@ def _draw_fov_color(screen, agent, color, show_fov):
     view_r = float(VIEW_RANGE)
     half_fov_val = HALF_FOV
     fov_degrees_val = FOV_DEGREES
+    tile_size_val = float(TILE_SIZE)
     if agent.active_weapon and getattr(agent.active_weapon, 'name', '') == 'sniper':
-        from game.fov import SNIPER_VIEW_RANGE, SNIPER_HALF_FOV, SNIPER_FOV_DEGREES
+        from game.fov import SNIPER_VIEW_RANGE, SNIPER_HALF_FOV, SNIPER_FOV_DEGREES, SNIPER_TILE_SIZE
         view_r = float(SNIPER_VIEW_RANGE)
         half_fov_val = float(SNIPER_HALF_FOV)
         fov_degrees_val = float(SNIPER_FOV_DEGREES)
+        tile_size_val = float(SNIPER_TILE_SIZE)
 
     pts = [(agent.x, agent.y)]
     steps = 60
@@ -509,8 +511,8 @@ def _draw_fov_color(screen, agent, color, show_fov):
         sin_rel = math.sin(rad_rel)
         ft_val = view_r * cos_rel
         rt_val = view_r * sin_rel
-        wx = agent.x + (fwd_x * ft_val + rgt_x * rt_val) * TILE_SIZE
-        wy = agent.y + (fwd_y * ft_val + rgt_y * rt_val) * TILE_SIZE
+        wx = agent.x + (fwd_x * ft_val + rgt_x * rt_val) * tile_size_val
+        wy = agent.y + (fwd_y * ft_val + rgt_y * rt_val) * tile_size_val
         pts.append((wx, wy))
     pts.append((agent.x, agent.y))
     if len(pts) > 2:
