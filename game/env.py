@@ -10,6 +10,7 @@ from typing import List, Tuple, Optional
 
 import numpy as np
 import pygame
+from numba import njit
 
 from game.config import (
     TILE_SIZE, COLS, ROWS, WIDTH, HEIGHT, FPS,
@@ -41,6 +42,92 @@ from game.npc import enemy_actions, teammate_actions
 # ─── 常數 ────────────────────────────────────────────
 NUM_CHANNELS = 10
 NUM_SCALARS = 25
+
+
+# ═══════════════════════════════════════════════════════
+#  Numba 加速的實體投影函數
+# ═══════════════════════════════════════════════════════
+
+@njit(cache=True)
+def _inject_value_njit(channel, r_f, c_f, value, view_size):
+    """雙線性插值注入值（Numba 版本）"""
+    r0 = int(_math.floor(r_f))
+    c0 = int(_math.floor(c_f))
+    dr = r_f - r0
+    dc = c_f - c0
+    if 0 <= r0 < view_size and 0 <= c0 < view_size:
+        channel[r0, c0] += value * (1.0 - dr) * (1.0 - dc)
+    if 0 <= r0 < view_size and 0 <= c0 + 1 < view_size:
+        channel[r0, c0 + 1] += value * (1.0 - dr) * dc
+    if 0 <= r0 + 1 < view_size and 0 <= c0 < view_size:
+        channel[r0 + 1, c0] += value * dr * (1.0 - dc)
+    if 0 <= r0 + 1 < view_size and 0 <= c0 + 1 < view_size:
+        channel[r0 + 1, c0 + 1] += value * dr * dc
+
+
+@njit(cache=True)
+def _project_entities_njit(
+    channel, entities_x, entities_y, entities_val, team_ids, entity_teams,
+    ax, ay, fwd_x, fwd_y, rgt_x, rgt_y,
+    cur_tile_size, cur_view_range, cur_half_fov, view_center, view_size,
+    check_fov, check_team
+):
+    """批次投影實體到視野矩陣（敵人/隊友雷達）
+    check_fov: True=需要 FOV 檢查（敵人），False=全局可見（隊友）
+    check_team: True=過濾同隊，False=過濾不同隊
+    """
+    for i in range(len(entities_x)):
+        # Team filter
+        if check_team and entity_teams[i] != team_ids[i]:
+            continue
+        if not check_team and entity_teams[i] == team_ids[i]:
+            continue
+
+        dx = entities_x[i] - ax
+        dy = entities_y[i] - ay
+        ft = (dx * fwd_x + dy * fwd_y) / cur_tile_size
+        rt = (dx * rgt_x + dy * rgt_y) / cur_tile_size
+        dt = _math.hypot(ft, rt)
+
+        if check_fov:
+            # 需要 FOV 檢查（敵人）
+            ang = _math.degrees(_math.atan2(rt, ft)) if dt > 0 else 0.0
+            if dt > cur_view_range or abs(ang) > cur_half_fov:
+                continue
+
+        # 投影到視野坐標
+        dr = (ft + rt) / 1.41421356
+        dc = (ft - rt) / 1.41421356
+        r_f = view_center + dr
+        c_f = view_center + dc
+
+        # 邊界檢查並注入
+        if 0 <= r_f < view_size and 0 <= c_f < view_size:
+            _inject_value_njit(channel, r_f, c_f, entities_val[i], view_size)
+
+
+@njit(cache=True)
+def _project_items_njit(
+    channel, items_x, items_y, item_values,
+    ax, ay, fwd_x, fwd_y, rgt_x, rgt_y,
+    cur_tile_size, cur_view_range, cur_half_fov, view_center, view_size
+):
+    """批次投影道具/威脅到視野矩陣"""
+    for i in range(len(items_x)):
+        dx = items_x[i] - ax
+        dy = items_y[i] - ay
+        ft = (dx * fwd_x + dy * fwd_y) / cur_tile_size
+        rt = (dx * rgt_x + dy * rgt_y) / cur_tile_size
+        dt = _math.hypot(ft, rt)
+        ang = _math.degrees(_math.atan2(rt, ft)) if dt > 0 else 0.0
+
+        if dt <= cur_view_range and abs(ang) <= cur_half_fov:
+            dr = (ft + rt) / 1.41421356
+            dc = (ft - rt) / 1.41421356
+            r_f = view_center + dr
+            c_f = view_center + dc
+            if 0 <= r_f < view_size and 0 <= c_f < view_size:
+                _inject_value_njit(channel, r_f, c_f, item_values[i], view_size)
 
 
 # 道具生成權重
@@ -331,21 +418,11 @@ class GameEnv:
                 if not self.is_wall(me.x, me.y + push_y):
                     me.y += push_y
 
-    # ── 雙線性插值 ──
+    # ── 雙線性插值（使用 Numba 加速版本）──
 
     def _inject_value(self, channel, r_f, c_f, value):
-        r0 = int(math.floor(r_f))
-        c0 = int(math.floor(c_f))
-        dr = r_f - r0
-        dc = c_f - c0
-        if 0 <= r0 < VIEW_SIZE and 0 <= c0 < VIEW_SIZE:
-            channel[r0, c0] += value * (1.0 - dr) * (1.0 - dc)
-        if 0 <= r0 < VIEW_SIZE and 0 <= c0 + 1 < VIEW_SIZE:
-            channel[r0, c0 + 1] += value * (1.0 - dr) * dc
-        if 0 <= r0 + 1 < VIEW_SIZE and 0 <= c0 < VIEW_SIZE:
-            channel[r0 + 1, c0] += value * dr * (1.0 - dc)
-        if 0 <= r0 + 1 < VIEW_SIZE and 0 <= c0 + 1 < VIEW_SIZE:
-            channel[r0 + 1, c0 + 1] += value * dr * dc
+        """調用 Numba 編譯的快速版本"""
+        _inject_value_njit(channel, r_f, c_f, value, VIEW_SIZE)
 
     # ═══════════════════════════════════════════════════════
     #  觀測生成（6ch + 22 scalars）
@@ -408,21 +485,26 @@ class GameEnv:
                 val = -1.0 if other.is_downed() else other.hp / 200.0
                 self._inject_value(view[1], VIEW_CENTER + dr, VIEW_CENTER + dc, val)
 
-        # Ch2: 隊友雷達（team_id 相同、全域可見）
+        # Ch2: 隊友雷達（team_id 相同、全域可見，批次處理）
+        mate_xs, mate_ys, mate_vals = [], [], []
         for other in self.all_agents:
             if not other.alive() or other is agent or other.team_id != agent.team_id:
                 continue
-            dx = other.x - ax
-            dy = other.y - ay
-            mft = (dx * fwd_x + dy * fwd_y) / cur_tile_size
-            mrt = (dx * rgt_x + dy * rgt_y) / cur_tile_size
-            dr = (mft + mrt) / 1.41421356
-            dc = (mft - mrt) / 1.41421356
-            r_f = np.clip(VIEW_CENTER + dr, 0.0, VIEW_SIZE - 1.001)
-            c_f = np.clip(VIEW_CENTER + dc, 0.0, VIEW_SIZE - 1.001)
+            mate_xs.append(other.x)
+            mate_ys.append(other.y)
             # 倒地的隊友使用 -1.0，讓神經網路知道需要去救援
             val = -1.0 if other.is_downed() else other.hp / 200.0
-            self._inject_value(view[2], r_f, c_f, val)
+            mate_vals.append(val)
+
+        if mate_xs:
+            mate_xs_arr = np.array(mate_xs, dtype=np.float32)
+            mate_ys_arr = np.array(mate_ys, dtype=np.float32)
+            mate_vals_arr = np.array(mate_vals, dtype=np.float32)
+            _project_items_njit(
+                view[2], mate_xs_arr, mate_ys_arr, mate_vals_arr,
+                float(ax), float(ay), float(fwd_x), float(fwd_y), float(rgt_x), float(rgt_y),
+                cur_tile_size, 999.0, 360.0, float(VIEW_CENTER), VIEW_SIZE  # 隊友全局可見
+            )
 
         # Ch3: 威脅/彈道熱力圖
         for p in self.projectiles:

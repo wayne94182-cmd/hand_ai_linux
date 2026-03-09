@@ -17,7 +17,7 @@ MAX_FRAMES = 1200
 
 
 class GameConfig:
-    SHOOT_PENALTY = 0.02
+    SHOOT_PENALTY = 0.04
     RADAR_REWARD = 0.005
     SURVIVAL_COST = 0.01
     NPC_SURVIVAL_COST = 0.003
@@ -40,7 +40,7 @@ class GameConfig:
     TIE_PENALTY = 6.0
     COLLISION_PENALTY = 0.005
 
-    aim_reward = 0.02
+    aim_reward = 0.00
     NPC_KILL_REWARD = 10.0
     ALIVE_NPC_PENALTY = 5.0
     BE_REVIVED_REWARD = 3.0

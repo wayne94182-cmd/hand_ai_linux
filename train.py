@@ -3,6 +3,7 @@ train.py — MAPPO + N-Agent Flatten 訓練腳本
 支援多個 learning agents、LSTM 隱藏狀態管理、
 通訊向量、action masking、以及分離的 Actor / Critic 優化。
 修正：feat.detach / action masking / comm team filter / critic team grouping
+優化：共享內存零拷貝、預分配緩衝區、Numba 加速
 """
 import argparse
 import logging
@@ -37,19 +38,20 @@ logger = logging.getLogger(__name__)
 
 # ── 超參數 ──────────────────────────────────────────────
 FRAME_SKIP = 2
-NUM_ENVS = 128
+NUM_ENVS = 96
+ROLLOUT_STEPS = 512  # 固定步數採樣（Fixed-Length Rollout）
 GAMMA = 0.990
 GAE_LAMBDA = 0.95
 PPO_EPOCHS = 4
 CLIP_EPS = 0.2
 VALUE_COEF = 0.5
-ENT_START = 0.1
-ENT_END = 0.03
-LR = 3e-4
+ENT_START = 0.05
+ENT_END = 0.02
+LR = 1.5e-4
 MAX_GRAD = 0.5
 
 ROLLING_WIN_WINDOW = 200
-SAVE_EVERY = 2500
+SAVE_EVERY = 5000
 STOP_SIGNAL_FILE = "STOP_AND_SAVE"
 
 # 新增超參數
@@ -255,19 +257,21 @@ def train(resume_path=None, forced_stage=None, target_stage_eps=50000, n_ai=2):
 
     model = ConvLSTM().to(device)
     critic = TeamPoolingCritic().to(device)
-    optimizer = optim.Adam(model.parameters(), lr=LR)
-    optimizer_critic = optim.Adam(critic.parameters(), lr=LR)
+
+    # GPU 優化：使用 foreach=True（批量更新參數，兼容 AMP）
+    # 注意：fused=True 不能與 GradScaler 一起使用，所以用 foreach
+    use_foreach = device.type == "cuda"
+    optimizer = optim.AdamW(model.parameters(), lr=LR, foreach=use_foreach)
+    optimizer_critic = optim.AdamW(critic.parameters(), lr=LR, foreach=use_foreach)
+
     use_amp = device.type == "cuda"
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
     # torch.compile 加速（僅 CUDA）
-    torch.backends.cudnn.benchmark = False  # max_t 動態變化，不開 benchmark
+    torch.backends.cudnn.benchmark = True   # 固定形狀，啟用 cuDNN 自動優化
     if device.type == "cuda":
         model  = torch.compile(model,  dynamic=True)
         critic = torch.compile(critic, dynamic=True)
-        pass
-        #     model  = torch.compile(model,  dynamic=True)
-        #     critic = torch.compile(critic, dynamic=True)
     total_eps_done = 0
     save_milestone = SAVE_EVERY
     resume_stage = 0
@@ -339,16 +343,29 @@ def train(resume_path=None, forced_stage=None, target_stage_eps=50000, n_ai=2):
         # 追蹤每個 flat index 目前的 action mask
         last_masks = np.ones((FLAT_BATCH, NUM_ACTIONS_DISCRETE), dtype=bool)
 
-        # 軌跡收集（per flat index）
-        traj = [{"states": [], "actions": [], "rewards": [], "values": [],
-                 "old_lp": [], "comm_acts": [], "comm_lp": [],
-                 "comm_mu": [], "comm_logstd": [], "masks": []}
-                for _ in range(FLAT_BATCH)]
-        episode_done = [False] * NUM_ENVS
+        # 固定步數採樣：預分配緩衝區（形狀永遠固定）
+        buf_states = np.zeros((ROLLOUT_STEPS, FLAT_BATCH, NUM_CHANNELS, VIEW_SIZE, VIEW_SIZE), dtype=np.float32)
+        buf_scalars = np.zeros((ROLLOUT_STEPS, FLAT_BATCH, NUM_SCALARS), dtype=np.float32)
+        buf_actions = np.zeros((ROLLOUT_STEPS, FLAT_BATCH, NUM_ACTIONS_DISCRETE), dtype=np.float32)
+        buf_values = np.zeros((ROLLOUT_STEPS, FLAT_BATCH), dtype=np.float32)
+        buf_old_lp = np.zeros((ROLLOUT_STEPS, FLAT_BATCH), dtype=np.float32)
+        buf_comm_acts = np.zeros((ROLLOUT_STEPS, FLAT_BATCH, NUM_COMM), dtype=np.float32)
+        buf_comm_lp = np.zeros((ROLLOUT_STEPS, FLAT_BATCH), dtype=np.float32)
+        buf_comm_mu = np.zeros((ROLLOUT_STEPS, FLAT_BATCH, NUM_COMM), dtype=np.float32)
+        buf_comm_logstd = np.zeros((ROLLOUT_STEPS, FLAT_BATCH, NUM_COMM), dtype=np.float32)
+        buf_masks = np.ones((ROLLOUT_STEPS, FLAT_BATCH, NUM_ACTIONS_DISCRETE), dtype=bool)
+        buf_rewards = np.zeros((ROLLOUT_STEPS, FLAT_BATCH), dtype=np.float32)
+        buf_dones = np.zeros((ROLLOUT_STEPS, FLAT_BATCH), dtype=bool)  # 追蹤 episode 邊界
+
+        # 統計信息（以局為單位記錄，而非以 env 為單位）
+        total_episode_count = 0
         env_downs = [0] * NUM_ENVS
         env_wins = [0] * NUM_ENVS
+        # 每局各別的 down 數，用來計算 d0/d1/d2 分布
+        episode_down_counts = []  # 每局結束時記錄一筆 down 數
 
-        while not all(episode_done):
+        # 固定步數採樣循環
+        for step in range(ROLLOUT_STEPS):
             # 1. 從 NUM_ENVS 個環境收集狀態
             s_np = np.zeros((NUM_ENVS, n_ai, NUM_CHANNELS, VIEW_SIZE, VIEW_SIZE), dtype=np.float32)
             sc_np = np.zeros((NUM_ENVS, n_ai, NUM_SCALARS), dtype=np.float32)
@@ -418,28 +435,20 @@ def train(resume_path=None, forced_stage=None, target_stage_eps=50000, n_ai=2):
             mu_np = mu.cpu().numpy()
             logstd_np = logstd.cpu().numpy()
 
-            # 存軌跡
+            # 存軌跡（直接使用 step 索引，無需判斷）
             for i in range(n_ai):
                 for j in range(NUM_ENVS):
-                    if episode_done[j]:
-                        continue
                     flat = i * NUM_ENVS + j
-                    traj[flat]["states"].append((
-                        torch.from_numpy(s_flat[flat].copy()),
-                        torch.from_numpy(sc_flat[flat].copy()),
-                    ))
-                    traj[flat]["actions"].append(torch.from_numpy(acts_np[flat].copy()))
-                    traj[flat]["values"].append(float(vals_np[flat]))
-                    traj[flat]["old_lp"].append(float(lp_disc_np[flat]))
-                    traj[flat]["comm_acts"].append(
-                        torch.from_numpy(comm_np_new[flat].copy()))
-                    traj[flat]["comm_lp"].append(float(lp_comm_np[flat]))
-                    traj[flat]["comm_mu"].append(
-                        torch.from_numpy(mu_np[flat].copy()))
-                    traj[flat]["comm_logstd"].append(
-                        torch.from_numpy(logstd_np[flat].copy()))
-                    traj[flat]["masks"].append(
-                        torch.from_numpy(last_masks[flat].copy()))
+                    buf_states[step, flat] = s_flat[flat]
+                    buf_scalars[step, flat] = sc_flat[flat]
+                    buf_actions[step, flat] = acts_np[flat]
+                    buf_values[step, flat] = vals_np[flat]
+                    buf_old_lp[step, flat] = lp_disc_np[flat]
+                    buf_comm_acts[step, flat] = comm_np_new[flat]
+                    buf_comm_lp[step, flat] = lp_comm_np[flat]
+                    buf_comm_mu[step, flat] = mu_np[flat]
+                    buf_comm_logstd[step, flat] = logstd_np[flat]
+                    buf_masks[step, flat] = last_masks[flat]
 
             # 6. 還原形狀派發給 env
             acts_env = acts_np.reshape(n_ai, NUM_ENVS, NUM_ACTIONS_DISCRETE).transpose(1, 0, 2)
@@ -452,105 +461,98 @@ def train(resume_path=None, forced_stage=None, target_stage_eps=50000, n_ai=2):
             vec_env.step_async(env_actions, FRAME_SKIP)
             all_states, all_rewards, dones, new_all_states, infos = vec_env.step_wait()
 
+            # 處理 reward 和環境重置
             next_env_states = list(env_states)
             for j in range(NUM_ENVS):
-                if episode_done[j]:
-                    continue
                 # 存 reward
                 for i in range(n_ai):
                     flat = i * NUM_ENVS + j
                     rew = all_rewards[j][i] if isinstance(all_rewards[j], list) else all_rewards[j]
-                    traj[flat]["rewards"].append(float(rew))
+                    buf_rewards[step, flat] = rew
+                    buf_dones[step, flat] = dones[j]  # 記錄 episode 邊界
 
-                # Fix 2B: 從 info 取回真實 action mask
+                # 更新 action mask
                 raw_masks = infos[j].get("action_masks", [[True]*NUM_ACTIONS_DISCRETE for _ in range(n_ai)])
                 for i in range(n_ai):
                     flat = i * NUM_ENVS + j
                     last_masks[flat] = np.array(raw_masks[i], dtype=bool) if i < len(raw_masks) else np.ones(NUM_ACTIONS_DISCRETE, dtype=bool)
 
+                # 環境 done 時立刻 reset（無縫接軌）
                 if dones[j]:
-                    episode_done[j] = True
+                    # 統計信息（以局為單位記錄）
+                    total_episode_count += 1
+                    ep_downs = infos[j].get("down_count", 0)
+                    env_downs[j] += ep_downs
+                    ep_win = 1 if infos[j].get("ai_win", False) else 0
+                    env_wins[j] += ep_win
+                    # 記錄這一局的 down 數與勝負，供 rolling_win 使用
+                    episode_down_counts.append((ep_downs, ep_win))
+
+                    # 立刻重置環境
                     next_env_states[j] = new_all_states[j]
+
+                    # 清空 LSTM 狀態（防止記憶污染）
                     for i in range(n_ai):
                         flat = i * NUM_ENVS + j
                         h[:, flat, :] = 0.0
                         c[:, flat, :] = 0.0
                         last_comm[flat] = 0.0
-                        last_masks[flat] = True  # reset masks
-                    env_downs[j] = infos[j].get("down_count", 0)
-                    env_wins[j] = 1 if infos[j].get("ai_win", False) else 0
+                        last_masks[flat] = True
                 else:
                     next_env_states[j] = all_states[j]
+
             env_states = next_env_states
 
-        # ── GAE ──
-        # 判斷本次 rollout 是 done 還是 timeout（所有 env 都 done 表示真實 done）
-        # 若有任何 env 是因達到 max_frames 而結束（timeout），需要 bootstrap
-        # 此處簡化處理：每個 env 的結束情況已儲存在 episode_done 與 infos 裡，
-        # 使用 info.get('timeout', False) 判斷；若無此欄位，預設為 False
-        env_timeout = [infos[j].get("timeout", False) for j in range(NUM_ENVS)]
+        # ── GAE（固定步數，處理跨 episode 邊界）──
+        buf_advantages = np.zeros((ROLLOUT_STEPS, FLAT_BATCH), dtype=np.float32)
+        buf_returns = np.zeros((ROLLOUT_STEPS, FLAT_BATCH), dtype=np.float32)
 
-        # 對需要 bootstrap 的 flat index，用最後一步的 value 估算 last_value
+        # 對每個 flat index 計算 GAE（處理 done 標記作為 episode 邊界）
         all_advs = []
         for flat in range(FLAT_BATCH):
-            rews = traj[flat]["rewards"]
-            vals = traj[flat]["values"]
-            if not rews:
-                traj[flat]["advantages"] = []
-                traj[flat]["returns"] = []
-                continue
-            j = flat % NUM_ENVS
-            is_timeout = env_timeout[j]
-            # last_value: 若 timeout，使用最後一步的 critic value 作 bootstrap
-            last_val = vals[-1] if is_timeout else 0.0
-            advs = compute_gae(rews, vals, last_value=last_val, truncated=is_timeout)
-            rets = [a + v for a, v in zip(advs, vals)]
-            traj[flat]["advantages"] = advs
-            traj[flat]["returns"] = rets
-            all_advs.extend(advs)
+            rews = buf_rewards[:, flat]
+            vals = buf_values[:, flat]
+            dones = buf_dones[:, flat]
 
+            # 分段計算 GAE（根據 done 標記切分 episode）
+            episode_start = 0
+            for t in range(ROLLOUT_STEPS):
+                if dones[t] or t == ROLLOUT_STEPS - 1:
+                    # Episode 結束，計算這段的 GAE
+                    episode_end = t + 1
+                    ep_rews = rews[episode_start:episode_end].tolist()
+                    ep_vals = vals[episode_start:episode_end].tolist()
+
+                    # Bootstrap: done 時 last_value=0，否則使用最後的 value
+                    last_val = 0.0 if dones[t] else ep_vals[-1]
+                    ep_advs = compute_gae(ep_rews, ep_vals, last_value=last_val, truncated=not dones[t])
+                    ep_rets = [a + v for a, v in zip(ep_advs, ep_vals)]
+
+                    buf_advantages[episode_start:episode_end, flat] = ep_advs
+                    buf_returns[episode_start:episode_end, flat] = ep_rets
+                    all_advs.extend(ep_advs)
+
+                    episode_start = episode_end
+
+        # Normalize advantages
         if len(all_advs) > 1:
             a_mean = float(np.mean(all_advs))
             a_std = float(np.std(all_advs)) + 1e-8
-            for flat in range(FLAT_BATCH):
-                traj[flat]["advantages"] = [
-                    (a - a_mean) / a_std for a in traj[flat]["advantages"]]
+            buf_advantages = (buf_advantages - a_mean) / a_std
 
-        # ── 打包 batch tensor ──
-        t_per_flat = [len(traj[f]["states"]) for f in range(FLAT_BATCH)]
-        max_t = max(t_per_flat) if t_per_flat and max(t_per_flat) > 0 else 1
-
-        bat_states = torch.zeros(max_t, FLAT_BATCH, NUM_CHANNELS, VIEW_SIZE, VIEW_SIZE)
-        bat_scalars = torch.zeros(max_t, FLAT_BATCH, NUM_SCALARS)
-        bat_actions = torch.zeros(max_t, FLAT_BATCH, NUM_ACTIONS_DISCRETE)
-        bat_old_lp = torch.zeros(max_t, FLAT_BATCH)
-        bat_adv = torch.zeros(max_t, FLAT_BATCH)
-        bat_ret = torch.zeros(max_t, FLAT_BATCH)
-        bat_comm_acts = torch.zeros(max_t, FLAT_BATCH, NUM_COMM)
-        bat_comm_lp = torch.zeros(max_t, FLAT_BATCH)
-        bat_comm_mu = torch.zeros(max_t, FLAT_BATCH, NUM_COMM)
-        bat_comm_logstd = torch.zeros(max_t, FLAT_BATCH, NUM_COMM)
-        bat_masks = torch.ones(max_t, FLAT_BATCH, NUM_ACTIONS_DISCRETE, dtype=torch.bool)
-        mask = torch.zeros(max_t, FLAT_BATCH, dtype=torch.bool)
-
-        for f in range(FLAT_BATCH):
-            t_i = t_per_flat[f]
-            if t_i == 0:
-                continue
-            mask[:t_i, f] = True
-            bat_states[:t_i, f] = torch.stack([x[0] for x in traj[f]["states"]])
-            bat_scalars[:t_i, f] = torch.stack([x[1] for x in traj[f]["states"]])
-            bat_actions[:t_i, f] = torch.stack(traj[f]["actions"])
-            bat_old_lp[:t_i, f] = torch.tensor(traj[f]["old_lp"])
-            bat_adv[:t_i, f] = torch.tensor(traj[f]["advantages"])
-            bat_ret[:t_i, f] = torch.tensor(traj[f]["returns"])
-            if traj[f]["comm_acts"]:
-                bat_comm_acts[:t_i, f] = torch.stack(traj[f]["comm_acts"])
-                bat_comm_lp[:t_i, f] = torch.tensor(traj[f]["comm_lp"])
-                bat_comm_mu[:t_i, f] = torch.stack(traj[f]["comm_mu"])
-                bat_comm_logstd[:t_i, f] = torch.stack(traj[f]["comm_logstd"])
-            if traj[f]["masks"]:
-                bat_masks[:t_i, f] = torch.stack(traj[f]["masks"])
+        # ── 打包 batch tensor（形狀固定，無需 mask）──
+        # 使用 as_tensor 零拷貝
+        bat_states = torch.as_tensor(buf_states, dtype=torch.float32)
+        bat_scalars = torch.as_tensor(buf_scalars, dtype=torch.float32)
+        bat_actions = torch.as_tensor(buf_actions, dtype=torch.float32)
+        bat_old_lp = torch.as_tensor(buf_old_lp, dtype=torch.float32)
+        bat_adv = torch.as_tensor(buf_advantages, dtype=torch.float32)
+        bat_ret = torch.as_tensor(buf_returns, dtype=torch.float32)
+        bat_comm_acts = torch.as_tensor(buf_comm_acts, dtype=torch.float32)
+        bat_comm_lp = torch.as_tensor(buf_comm_lp, dtype=torch.float32)
+        bat_comm_mu = torch.as_tensor(buf_comm_mu, dtype=torch.float32)
+        bat_comm_logstd = torch.as_tensor(buf_comm_logstd, dtype=torch.float32)
+        bat_masks = torch.as_tensor(buf_masks, dtype=torch.bool)
 
         # pin_memory + non_blocking 加速 CPU→GPU 傳輸
         if device.type == "cuda":
@@ -565,7 +567,6 @@ def train(resume_path=None, forced_stage=None, target_stage_eps=50000, n_ai=2):
             bat_comm_mu     = bat_comm_mu.pin_memory()
             bat_comm_logstd = bat_comm_logstd.pin_memory()
             bat_masks       = bat_masks.pin_memory()
-            mask            = mask.pin_memory()
 
         bat_states      = bat_states.to(device, non_blocking=True)
         bat_scalars     = bat_scalars.to(device, non_blocking=True)
@@ -578,7 +579,6 @@ def train(resume_path=None, forced_stage=None, target_stage_eps=50000, n_ai=2):
         bat_comm_mu     = bat_comm_mu.to(device, non_blocking=True)
         bat_comm_logstd = bat_comm_logstd.to(device, non_blocking=True)
         bat_masks       = bat_masks.to(device, non_blocking=True)
-        mask            = mask.to(device, non_blocking=True)
 
         # Fix 7: 預計算每個 flat index 的 team_id（用最後一次觀測到的 team）
         flat_team_ids = np.zeros(FLAT_BATCH, dtype=np.int32)
@@ -611,16 +611,14 @@ def train(resume_path=None, forced_stage=None, target_stage_eps=50000, n_ai=2):
                     comm_in=None,
                     seq_mode=True
                 )
-            # logits_all: (max_t, FLAT_BATCH, NUM_ACTIONS_DISCRETE)
-            # feat_all:   (max_t, FLAT_BATCH, HIDDEN_SIZE)
+            # logits_all: (ROLLOUT_STEPS, FLAT_BATCH, NUM_ACTIONS_DISCRETE)
+            # feat_all:   (ROLLOUT_STEPS, FLAT_BATCH, HIDDEN_SIZE)
 
             logits_all = logits_all.float()
             feat_all   = feat_all.float()
 
-            # 展平所有時間步 → (max_t * FLAT_BATCH, ...)
-            TB = max_t * FLAT_BATCH
-            valid_flat = mask.reshape(TB)                             # (TB,)
-            n_valid = valid_flat.float().sum().clamp(min=1)
+            # 展平所有時間步 → (ROLLOUT_STEPS * FLAT_BATCH, ...)
+            TB = ROLLOUT_STEPS * FLAT_BATCH
 
             logits_flat = logits_all.reshape(TB, NUM_ACTIONS_DISCRETE)
             mu_flat     = mu_all.reshape(TB, NUM_COMM)
@@ -660,36 +658,32 @@ def train(resume_path=None, forced_stage=None, target_stage_eps=50000, n_ai=2):
                            - entropy_coef * entropy_d
                            - COMM_ENT_COEF * comm_entropy)
 
-            t_actor_loss = (total_actor * valid_flat.float()).sum() / n_valid
+            t_actor_loss = total_actor.mean()
 
             # Critic（需按 team 分組）
             feat_d = feat_flat.detach()   # (TB, HIDDEN_SIZE)
 
-            # 展平 team mask: (max_t, FLAT_BATCH) → (TB,)
+            # 展平 team mask: (ROLLOUT_STEPS, FLAT_BATCH) → (TB,)
             # 每個時間步的 team 分配都一樣，所以直接 expand
-            team0_exp = team0_mask_t.unsqueeze(0).expand(max_t, -1).reshape(TB)
-            team1_exp = team1_mask_t.unsqueeze(0).expand(max_t, -1).reshape(TB)
-
-            # valid + team
-            v0_idx = valid_flat & team0_exp
-            v1_idx = valid_flat & team1_exp
+            team0_exp = team0_mask_t.unsqueeze(0).expand(ROLLOUT_STEPS, -1).reshape(TB)
+            team1_exp = team1_mask_t.unsqueeze(0).expand(ROLLOUT_STEPS, -1).reshape(TB)
 
             v_pred_flat = torch.zeros(TB, device=device)
 
-            if v0_idx.any():
-                t0_feat = feat_d[v0_idx]
-                t1_feat = feat_d[v1_idx] if v1_idx.any() else None
+            if team0_exp.any():
+                t0_feat = feat_d[team0_exp]
+                t1_feat = feat_d[team1_exp] if team1_exp.any() else None
                 v0 = critic(t0_feat, t1_feat)
-                v_pred_flat[v0_idx] = v0
+                v_pred_flat[team0_exp] = v0
 
-            if v1_idx.any():
-                t1_feat = feat_d[v1_idx]
-                t0_feat = feat_d[v0_idx] if v0_idx.any() else None
+            if team1_exp.any():
+                t1_feat = feat_d[team1_exp]
+                t0_feat = feat_d[team0_exp] if team0_exp.any() else None
                 v1 = critic(t1_feat, t0_feat)
-                v_pred_flat[v1_idx] = v1
+                v_pred_flat[team1_exp] = v1
 
             critic_l = (v_pred_flat - ret_flat).pow(2)
-            t_critic_loss = (critic_l * valid_flat.float()).sum() / n_valid
+            t_critic_loss = critic_l.mean()
 
             # Actor + Critic backward（兩者都過 scaler，確保 AMP 正確縮放）
             scaler.scale(t_actor_loss).backward()
@@ -708,16 +702,20 @@ def train(resume_path=None, forced_stage=None, target_stage_eps=50000, n_ai=2):
         batch_time = time.time() - batch_start_time
         elapsed = time.time() - start_time
 
+        # 固定步數採樣：計算 rollout 內的平均獎勵
+        # 注意：這是 rollout 片段的獎勵，不是完整 episode
         avg_rew_per_env = []
         for j in range(NUM_ENVS):
             env_total = 0.0
             for i in range(n_ai):
                 flat = i * NUM_ENVS + j
-                env_total += sum(traj[flat]["rewards"]) if traj[flat]["rewards"] else 0.0
+                # 所有 flat index 都收集了完整的 ROLLOUT_STEPS
+                env_total += buf_rewards[:, flat].sum()
             avg_rew_per_env.append(env_total / n_ai)
         avg_rew = float(np.mean(avg_rew_per_env))
 
-        for d, w in zip(env_downs, env_wins):
+        # 將本 batch 新增的局追加到 rolling window（以局而非以 env 為單位）
+        for d, w in episode_down_counts:
             rolling_win.append((d, w))
 
         roll_list = list(rolling_win)

@@ -81,6 +81,8 @@ class ConvLSTM(nn.Module):
         scalars: (N, num_scalars)
         回傳:    (N, hidden_size)
         """
+        # Channels Last 記憶體格式優化（GPU 加速）
+        x = x.to(memory_format=torch.channels_last)
         c1   = F.relu(self.bn1(self.conv1(x)))
         c2   = F.relu(self.bn2(self.conv2(c1)))
         c3   = F.relu(self.bn3(self.conv3(c2)))
@@ -94,7 +96,7 @@ class ConvLSTM(nn.Module):
     def _chunked_cnn_checkpoint(self, x_flat, sc_flat):
         """將編譯困難的迴圈抽離並關閉編譯，避免 Dynamo 發生 AssertionError"""
         N = x_flat.size(0)
-        chunk_size = 2048
+        chunk_size = 512  # 配合 ROLLOUT_STEPS 優化記憶體分配
         embed_chunks = []
         for i in range(0, N, chunk_size):
             cx = x_flat[i : i+chunk_size]
