@@ -357,12 +357,10 @@ def train(resume_path=None, forced_stage=None, target_stage_eps=50000, n_ai=2):
         buf_rewards = np.zeros((ROLLOUT_STEPS, FLAT_BATCH), dtype=np.float32)
         buf_dones = np.zeros((ROLLOUT_STEPS, FLAT_BATCH), dtype=bool)  # 追蹤 episode 邊界
 
-        # 統計信息（以局為單位記錄，而非以 env 為單位）
+        # 統計信息
         total_episode_count = 0
         env_downs = [0] * NUM_ENVS
         env_wins = [0] * NUM_ENVS
-        # 每局各別的 down 數，用來計算 d0/d1/d2 分布
-        episode_down_counts = []  # 每局結束時記錄一筆 down 數
 
         # 固定步數採樣循環
         for step in range(ROLLOUT_STEPS):
@@ -479,14 +477,10 @@ def train(resume_path=None, forced_stage=None, target_stage_eps=50000, n_ai=2):
 
                 # 環境 done 時立刻 reset（無縫接軌）
                 if dones[j]:
-                    # 統計信息（以局為單位記錄）
+                    # 統計信息
                     total_episode_count += 1
-                    ep_downs = infos[j].get("down_count", 0)
-                    env_downs[j] += ep_downs
-                    ep_win = 1 if infos[j].get("ai_win", False) else 0
-                    env_wins[j] += ep_win
-                    # 記錄這一局的 down 數與勝負，供 rolling_win 使用
-                    episode_down_counts.append((ep_downs, ep_win))
+                    env_downs[j] += infos[j].get("down_count", 0)
+                    env_wins[j] += 1 if infos[j].get("ai_win", False) else 0
 
                     # 立刻重置環境
                     next_env_states[j] = new_all_states[j]
@@ -714,8 +708,7 @@ def train(resume_path=None, forced_stage=None, target_stage_eps=50000, n_ai=2):
             avg_rew_per_env.append(env_total / n_ai)
         avg_rew = float(np.mean(avg_rew_per_env))
 
-        # 將本 batch 新增的局追加到 rolling window（以局而非以 env 為單位）
-        for d, w in episode_down_counts:
+        for d, w in zip(env_downs, env_wins):
             rolling_win.append((d, w))
 
         roll_list = list(rolling_win)
