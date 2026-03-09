@@ -5,4 +5,5 @@ source venv/bin/activate
 4.	跨stage與局數、商重置：python3 train.py --resume snn_S0_ep_30000.pth --stage 1 --stage_eps 80000
 5.	手動存檔並中止: touch STOP_AND_SAVE
 6.	觀戰（指定存檔+階段）: python watch.py --ckpt snn_S0_ep_70000.pth --stage 5 --ai_view
+7.  試玩：python play.py --stage 0 --n_ai 1 --max_frames 1200 --weapon sniper
 pkill -f train.py

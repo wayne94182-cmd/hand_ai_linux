@@ -45,6 +45,7 @@ class GameConfig:
     ALIVE_NPC_PENALTY = 5.0
     BE_REVIVED_REWARD = 3.0
     REVIVE_REWARD = 5.0
+    BE_DOWNED_PENALTY = 5.0
 
 
 @dataclass

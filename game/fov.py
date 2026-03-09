@@ -266,10 +266,11 @@ def njit_compute_fov_standard(ax, ay, fwd_x, fwd_y, rgt_x, rgt_y,
 
 def njit_compute_fov_sniper(ax, ay, fwd_x, fwd_y, rgt_x, rgt_y,
                              grid_np, tile_size, cols, rows, view_size):
-    """狙擊 FOV — 使用預綁定的 sniper tables"""
+    """狙擊 FOV — 使用預綁定的 sniper tables, 並將 tile_size 翻倍以達到視距放大的效果"""
+    from game.fov import SNIPER_TILE_SIZE
     return _njit_compute_fov_core(
         ax, ay, fwd_x, fwd_y, rgt_x, rgt_y, grid_np,
         _SNIPER_FOV_RC_NP, _SNIPER_FOV_FWD, _SNIPER_FOV_RIGHT,
         _SNIPER_RAY_FLAT, _SNIPER_RAY_OFFSETS, _SNIPER_RAY_LENGTHS,
-        tile_size, cols, rows, view_size,
+        SNIPER_TILE_SIZE, cols, rows, view_size,
     )

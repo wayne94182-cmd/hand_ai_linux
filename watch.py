@@ -492,10 +492,18 @@ def _draw_fov_color(screen, agent, color, show_fov):
     fwd_x, fwd_y = math.cos(rad), math.sin(rad)
     rgt_x, rgt_y = math.cos(rad + math.pi / 2), math.sin(rad + math.pi / 2)
     view_r = float(VIEW_RANGE)
+    half_fov_val = HALF_FOV
+    fov_degrees_val = FOV_DEGREES
+    if agent.active_weapon and getattr(agent.active_weapon, 'name', '') == 'sniper':
+        from game.fov import SNIPER_VIEW_RANGE, SNIPER_HALF_FOV, SNIPER_FOV_DEGREES
+        view_r = float(SNIPER_VIEW_RANGE)
+        half_fov_val = float(SNIPER_HALF_FOV)
+        fov_degrees_val = float(SNIPER_FOV_DEGREES)
+
     pts = [(agent.x, agent.y)]
     steps = 60
     for i in range(steps + 1):
-        deg_rel = -HALF_FOV + (FOV_DEGREES * i / steps)
+        deg_rel = -half_fov_val + (fov_degrees_val * i / steps)
         rad_rel = math.radians(deg_rel)
         cos_rel = math.cos(rad_rel)
         sin_rel = math.sin(rad_rel)

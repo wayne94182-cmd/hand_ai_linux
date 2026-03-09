@@ -353,7 +353,17 @@ class GameEnv:
 
         # 若持狙擊槍，使用 sniper FOV
         wp = agent.active_weapon
-        use_sniper = wp is not None and wp.is_sniper
+        use_sniper = wp is not None and getattr(wp, 'name', '') == 'sniper'
+
+        if use_sniper:
+            from game.fov import SNIPER_VIEW_RANGE, SNIPER_HALF_FOV, SNIPER_TILE_SIZE
+            cur_view_range = float(SNIPER_VIEW_RANGE)
+            cur_half_fov = float(SNIPER_HALF_FOV)
+            cur_tile_size = float(SNIPER_TILE_SIZE)
+        else:
+            cur_view_range = float(VIEW_RANGE)
+            cur_half_fov = float(HALF_FOV)
+            cur_tile_size = float(TILE_SIZE)
 
         view = np.zeros((NUM_CHANNELS, VIEW_SIZE, VIEW_SIZE), dtype=np.float32)
 
@@ -381,11 +391,11 @@ class GameEnv:
                 continue
             dx = other.x - ax
             dy = other.y - ay
-            ft = (dx * fwd_x + dy * fwd_y) / TILE_SIZE
-            rt = (dx * rgt_x + dy * rgt_y) / TILE_SIZE
+            ft = (dx * fwd_x + dy * fwd_y) / cur_tile_size
+            rt = (dx * rgt_x + dy * rgt_y) / cur_tile_size
             dt = math.hypot(ft, rt)
             ang = math.degrees(math.atan2(rt, ft)) if dt > 0 else 0.0
-            if dt <= VIEW_RANGE and abs(ang) <= HALF_FOV and self.has_line_of_sight(ax, ay, other.x, other.y):
+            if dt <= cur_view_range and abs(ang) <= cur_half_fov and self.has_line_of_sight(ax, ay, other.x, other.y):
                 dr = (ft + rt) / 1.41421356
                 dc = (ft - rt) / 1.41421356
                 # 倒地單位使用 -1.0，讓神經網路能清楚區分「倒地」與「殘血」
@@ -398,8 +408,8 @@ class GameEnv:
                 continue
             dx = other.x - ax
             dy = other.y - ay
-            mft = (dx * fwd_x + dy * fwd_y) / TILE_SIZE
-            mrt = (dx * rgt_x + dy * rgt_y) / TILE_SIZE
+            mft = (dx * fwd_x + dy * fwd_y) / cur_tile_size
+            mrt = (dx * rgt_x + dy * rgt_y) / cur_tile_size
             dr = (mft + mrt) / 1.41421356
             dc = (mft - mrt) / 1.41421356
             r_f = np.clip(VIEW_CENTER + dr, 0.0, VIEW_SIZE - 1.001)
@@ -412,11 +422,11 @@ class GameEnv:
         for p in self.projectiles:
             dx = p.x - ax
             dy = p.y - ay
-            ft = (dx * fwd_x + dy * fwd_y) / TILE_SIZE
-            rt = (dx * rgt_x + dy * rgt_y) / TILE_SIZE
+            ft = (dx * fwd_x + dy * fwd_y) / cur_tile_size
+            rt = (dx * rgt_x + dy * rgt_y) / cur_tile_size
             dt = math.hypot(ft, rt)
             ang = math.degrees(math.atan2(rt, ft)) if dt > 0 else 0.0
-            if dt <= VIEW_RANGE and abs(ang) <= HALF_FOV and self.has_line_of_sight(ax, ay, p.x, p.y):
+            if dt <= cur_view_range and abs(ang) <= cur_half_fov and self.has_line_of_sight(ax, ay, p.x, p.y):
                 if p.owner.team_id != agent.team_id:
                     hv = p.heatmap_value if hasattr(p, 'heatmap_value') else 0.5
                     val = hv
@@ -432,11 +442,11 @@ class GameEnv:
                 continue
             dx = g.x - ax
             dy = g.y - ay
-            ft = (dx * fwd_x + dy * fwd_y) / TILE_SIZE
-            rt = (dx * rgt_x + dy * rgt_y) / TILE_SIZE
+            ft = (dx * fwd_x + dy * fwd_y) / cur_tile_size
+            rt = (dx * rgt_x + dy * rgt_y) / cur_tile_size
             dt = math.hypot(ft, rt)
             ang = math.degrees(math.atan2(rt, ft)) if dt > 0 else 0.0
-            if dt <= VIEW_RANGE and abs(ang) <= HALF_FOV and self.has_line_of_sight(ax, ay, g.x, g.y):
+            if dt <= cur_view_range and abs(ang) <= cur_half_fov and self.has_line_of_sight(ax, ay, g.x, g.y):
                 val = 0.3 + 0.7 * (g.fuse_timer / max(1, g.fuse_frames))
                 dr = (ft + rt) / 1.41421356
                 dc = (ft - rt) / 1.41421356
@@ -463,11 +473,11 @@ class GameEnv:
         for item in self.ground_items:
             dx = item.x - ax
             dy = item.y - ay
-            ft = (dx * fwd_x + dy * fwd_y) / TILE_SIZE
-            rt = (dx * rgt_x + dy * rgt_y) / TILE_SIZE
+            ft = (dx * fwd_x + dy * fwd_y) / cur_tile_size
+            rt = (dx * rgt_x + dy * rgt_y) / cur_tile_size
             dt = math.hypot(ft, rt)
             ang = math.degrees(math.atan2(rt, ft)) if dt > 0 else 0.0
-            if dt <= VIEW_RANGE and abs(ang) <= HALF_FOV and self.has_line_of_sight(ax, ay, item.x, item.y):
+            if dt <= cur_view_range and abs(ang) <= cur_half_fov and self.has_line_of_sight(ax, ay, item.x, item.y):
                 dr = (ft + rt) / 1.41421356
                 dc = (ft - rt) / 1.41421356
                 if item.item_type == "weapon":
@@ -608,57 +618,7 @@ class GameEnv:
             act[7],   # dash
         ]
 
-        # 散彈槍特殊開火
-        wp = agent.active_weapon
-        if wp is not None and wp.is_shotgun and act[6] > 0.5 and agent.attack_cooldown == 0 and (agent.ammo > 0 or agent.infinite_ammo):
-            # 不用 apply_actions 的開火，自己處理多彈片
-            agent._tick_base()
-            # 移動部分仍需執行
-            up, dn, lt, rt_a, cw, ccw = act[0], act[1], act[2], act[3], act[4], act[5]
-            fwd_in = (1 if up > 0.5 else 0) - (1 if dn > 0.5 else 0)
-            right_in = (1 if rt_a > 0.5 else 0) - (1 if lt > 0.5 else 0)
-            turn_in = (1 if cw > 0.5 else 0) - (1 if ccw > 0.5 else 0)
-            focus = act[11]
-            turn_speed = 1.5 if focus > 0.5 else 8.0
-            cur_speed = agent.speed * (3 if agent.dash_timer > 0 else 1)
-
-            dash_reward = 0.0
-            if act[7] > 0.5 and agent.dash_cd == 0 and agent.dash_timer == 0 and agent.hp > GameConfig.DASH_COST_HP:
-                agent.dash_timer = 10
-                agent.dash_cd = 160
-                agent.hp -= GameConfig.DASH_COST_HP
-                dash_reward = GameConfig.DASH_PENALTY
-                cur_speed = agent.speed * 3
-
-            agent.angle = (agent.angle + turn_speed * turn_in) % 360
-            rad_a = math.radians(agent.angle)
-            fx, fy = math.cos(rad_a), math.sin(rad_a)
-            rx, ry = math.cos(rad_a + math.pi / 2), math.sin(rad_a + math.pi / 2)
-            dx = fx * cur_speed * fwd_in + rx * cur_speed * right_in
-            dy = fy * cur_speed * fwd_in + ry * cur_speed * right_in
-            agent._regen_tick(fwd_in, right_in)
-            self.try_move_agent(agent, dx, dy)
-            agent._reload_tick()
-
-            # 發射多彈片
-            base_rad = math.radians(agent.angle)
-            sx = agent.x + math.cos(base_rad) * (agent.radius + 5)
-            sy = agent.y + math.sin(base_rad) * (agent.radius + 5)
-            dmg = self.enemy_damage if agent.team.startswith("enemy") else self.bullet_damage
-            if wp:
-                dmg = wp.damage
-            for offset in wp.pellet_offsets:
-                pellet_angle = (agent.angle + offset) % 360
-                self.projectiles.append(
-                    Projectile(sx, sy, pellet_angle, owner=agent, damage=dmg, weapon_spec=wp)
-                )
-            agent.attack_cooldown = wp.fire_cooldown
-            if not agent.infinite_ammo:
-                agent.ammo -= 1
-            self.sound_waves.append(create_gunshot_wave(agent.x, agent.y, self.frame_count))
-            return True, dash_reward
-
-        # 一般開火（含狙擊、步槍、手槍）
+        # 開火與移動（含狙擊、步槍、手槍、散彈槍）
         did_shoot, dash_reward = agent.apply_actions(actions_9, self)
         if did_shoot:
             self.sound_waves.append(create_gunshot_wave(agent.x, agent.y, self.frame_count))
@@ -767,16 +727,30 @@ class GameEnv:
             enemy_in_sight = False
             best_angle = 180.0
 
+            # Determine if the agent is using a sniper
+            wp = agent.active_weapon
+            use_sniper = wp is not None and getattr(wp, 'name', '') == 'sniper'
+
+            if use_sniper:
+                from game.fov import SNIPER_VIEW_RANGE, SNIPER_HALF_FOV, SNIPER_TILE_SIZE
+                cur_view_range = float(SNIPER_VIEW_RANGE)
+                cur_half_fov = float(SNIPER_HALF_FOV)
+                cur_tile_size = float(SNIPER_TILE_SIZE)
+            else:
+                cur_view_range = float(VIEW_RANGE)
+                cur_half_fov = float(HALF_FOV)
+                cur_tile_size = float(TILE_SIZE)
+
             for other in self.all_agents:
                 if not other.alive() or other.team_id == agent.team_id or other.is_downed():
                     continue
                 dx = other.x - agent.x
                 dy = other.y - agent.y
-                ft = (dx * fx + dy * fy) / TILE_SIZE
-                rt = (dx * rx + dy * ry) / TILE_SIZE
+                ft = (dx * fx + dy * fy) / cur_tile_size
+                rt = (dx * rx + dy * ry) / cur_tile_size
                 dt = math.hypot(ft, rt)
                 ang = math.degrees(math.atan2(rt, ft)) if dt > 0 else 0.0
-                if dt <= VIEW_RANGE and abs(ang) <= HALF_FOV and self.has_line_of_sight(agent.x, agent.y, other.x, other.y):
+                if dt <= cur_view_range and abs(ang) <= cur_half_fov and self.has_line_of_sight(agent.x, agent.y, other.x, other.y):
                     enemy_in_sight = True
                     if abs(ang) < best_angle:
                         best_angle = abs(ang)
@@ -832,6 +806,8 @@ class GameEnv:
                     for i, la in enumerate(self.learning_agents):
                         if ag is la:
                             rewards[i] -= GameConfig.DAMAGE_PENALTY_COEF * p.damage
+                            if just_downed:
+                                rewards[i] -= GameConfig.BE_DOWNED_PENALTY
                         if p.owner is la and ag.team_id != la.team_id:
                             # 打到已倒地目標：不給擊中獎勵
                             if not was_downed_before:
@@ -883,6 +859,8 @@ class GameEnv:
                         for i, la in enumerate(self.learning_agents):
                             if ag is la:
                                 rewards[i] -= GameConfig.DAMAGE_PENALTY_COEF * dmg
+                                if just_downed:
+                                    rewards[i] -= GameConfig.BE_DOWNED_PENALTY
                             if g.owner is la and ag.team_id != la.team_id:
                                 if not was_downed_before:
                                     rewards[i] += GameConfig.HIT_REWARD_COEF * dmg
@@ -904,8 +882,14 @@ class GameEnv:
                 if dist > self.poison_radius:
                     overdist_ratio = (dist - self.poison_radius) / (TILE_SIZE * 5)
                     dmg = self.poison_dmg_per_frame * (1.0 + overdist_ratio)
+                    was_downed_before = agent.is_downed()
                     agent.hp -= dmg
+                    just_downed = (agent.hp <= 0 and not was_downed_before)
+                    if just_downed:
+                        agent.enter_downed()
                     rewards[i] -= 0.05 * (1.0 + overdist_ratio)
+                    if just_downed:
+                        rewards[i] -= GameConfig.BE_DOWNED_PENALTY
 
         # ── 存活時間指數獎勵（僅毒圈階段）──
         if self.stage_spec.has_poison_zone:
@@ -1085,11 +1069,18 @@ class GameEnv:
         rgt_x, rgt_y = math.cos(rad + math.pi / 2), math.sin(rad + math.pi / 2)
 
         view_r = float(VIEW_RANGE)
+        half_fov_val = HALF_FOV
+        fov_degrees_val = FOV_DEGREES
+        if a.active_weapon and getattr(a.active_weapon, 'name', '') == 'sniper':
+            from game.fov import SNIPER_VIEW_RANGE, SNIPER_HALF_FOV, SNIPER_FOV_DEGREES
+            view_r = float(SNIPER_VIEW_RANGE)
+            half_fov_val = float(SNIPER_HALF_FOV)
+            fov_degrees_val = float(SNIPER_FOV_DEGREES)
 
         pts = [(a.x, a.y)]
         steps = 60
         for i in range(steps + 1):
-            deg_rel = -HALF_FOV + (FOV_DEGREES * i / steps)
+            deg_rel = -half_fov_val + (fov_degrees_val * i / steps)
             rad_rel = math.radians(deg_rel)
             cos_rel = math.cos(rad_rel)
             sin_rel = math.sin(rad_rel)

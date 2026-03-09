@@ -206,12 +206,22 @@ class Agent:
             wp = self.active_weapon
             dmg = env.enemy_damage if self.team.startswith("enemy") else (wp.damage if wp else env.bullet_damage)
             
-            env.projectiles.append(Projectile(sx, sy, self.angle, owner=self, damage=dmg, weapon_spec=wp))
-            if self.infinite_ammo:
+            if wp is not None and getattr(wp, 'is_shotgun', False):
+                for offset in wp.pellet_offsets:
+                    pellet_angle = (self.angle + offset) % 360
+                    env.projectiles.append(Projectile(sx, sy, pellet_angle, owner=self, damage=dmg, weapon_spec=wp))
+            else:
+                env.projectiles.append(Projectile(sx, sy, self.angle, owner=self, damage=dmg, weapon_spec=wp))
+                
+            if wp is not None:
+                self.attack_cooldown = wp.fire_cooldown
+            elif self.infinite_ammo:
                 fire_rate = float(getattr(env.stage_spec, "enemy_fire_rate", 0.0))
                 self.attack_cooldown = max(1, int(FPS / fire_rate)) if fire_rate > 0 else 15
             else:
                 self.attack_cooldown = 15
+                
+            if not self.infinite_ammo:
                 self.ammo -= 1
             did_shoot = True
 
@@ -392,12 +402,27 @@ class Projectile:
         # 若有 weapon_spec，使用其參數；否則使用預設值
         if weapon_spec is not None:
             self.speed = weapon_spec.bullet_speed
-            self.life = weapon_spec.bullet_life
+        else:
+            self.speed = 18
+
+        # 計算飛出視野所需的最大幀數，避免移動速度過快時無限飛行
+        # 預設視野半徑為 VIEW_RANGE (10) * TILE_SIZE (40) = 400
+        view_dist = 400.0
+        if weapon_spec is not None and getattr(weapon_spec, 'name', '') == 'sniper':
+            from game.fov import SNIPER_VIEW_RANGE
+            # Sniper 有特殊的視距 (預設 10格但縮放變兩倍實體距離 或 直接更遠)
+            # 在 fov.py 中 sniper 視野為 VIEW_RANGE * TILE_SIZE * 2 (或更遠)
+            view_dist = 800.0 # 給予兩倍距離
+
+        max_valid_life = int(math.ceil(view_dist / self.speed))
+
+        if weapon_spec is not None:
+            # 放寬 sniper 子彈存活限制，確保能飛到目標
+            self.life = min(weapon_spec.bullet_life, max_valid_life)
             self.radius = 5
             self.heatmap_value = weapon_spec.heatmap_value
         else:
-            self.speed = 18
-            self.life = 22
+            self.life = min(22, max_valid_life)
             self.radius = 5
             self.heatmap_value = 0.5
 
