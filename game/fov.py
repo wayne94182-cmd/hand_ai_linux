@@ -198,7 +198,7 @@ def njit_compute_fov(
 def _njit_compute_fov_core(
     ax, ay, fwd_x, fwd_y, rgt_x, rgt_y, grid_np,
     fov_rc_np, fov_fwd, fov_right, ray_flat, ray_offsets, ray_lengths,
-    tile_size, cols, rows, view_size,
+    ray_tile_size, grid_tile_size, cols, rows, view_size,
 ):
     ch0 = np.full((view_size, view_size), -1.0, dtype=np.float32)
     n = fov_rc_np.shape[0]
@@ -209,11 +209,11 @@ def _njit_compute_fov_core(
         ft = fov_fwd[k]
         rt = fov_right[k]
 
-        wx = ax + fwd_x * ft * tile_size + rgt_x * rt * tile_size
-        wy = ay + fwd_y * ft * tile_size + rgt_y * rt * tile_size
+        wx = ax + fwd_x * ft * ray_tile_size + rgt_x * rt * ray_tile_size
+        wy = ay + fwd_y * ft * ray_tile_size + rgt_y * rt * ray_tile_size
 
-        tc = int(wx // tile_size)
-        tr_v = int(wy // tile_size)
+        tc = int(wx // grid_tile_size)
+        tr_v = int(wy // grid_tile_size)
 
         if not (0 <= tc < cols and 0 <= tr_v < rows):
             ch0[r_idx, c_idx] = 1.0
@@ -222,15 +222,15 @@ def _njit_compute_fov_core(
         off = ray_offsets[k]
         l = ray_lengths[k]
         blocked = False
-        prev_ic = int(ax // tile_size)
-        prev_ir = int(ay // tile_size)
+        prev_ic = int(ax // grid_tile_size)
+        prev_ir = int(ay // grid_tile_size)
         for j in range(l):
             fft = ray_flat[off + j, 0]
             rrt = ray_flat[off + j, 1]
-            ix = ax + fwd_x * fft * tile_size + rgt_x * rrt * tile_size
-            iy = ay + fwd_y * fft * tile_size + rgt_y * rrt * tile_size
-            ic = int(ix // tile_size)
-            ir = int(iy // tile_size)
+            ix = ax + fwd_x * fft * ray_tile_size + rgt_x * rrt * ray_tile_size
+            iy = ay + fwd_y * fft * ray_tile_size + rgt_y * rrt * ray_tile_size
+            ic = int(ix // grid_tile_size)
+            ir = int(iy // grid_tile_size)
             if 0 <= ic < cols and 0 <= ir < rows:
                 if grid_np[ir, ic] == 1:
                     blocked = True
@@ -260,7 +260,7 @@ def njit_compute_fov_standard(ax, ay, fwd_x, fwd_y, rgt_x, rgt_y,
         ax, ay, fwd_x, fwd_y, rgt_x, rgt_y, grid_np,
         _FOV_RC_NP, _FOV_FWD, _FOV_RIGHT,
         _RAY_FLAT, _RAY_OFFSETS, _RAY_LENGTHS,
-        tile_size, cols, rows, view_size,
+        tile_size, tile_size, cols, rows, view_size,
     )
 
 
@@ -272,5 +272,5 @@ def njit_compute_fov_sniper(ax, ay, fwd_x, fwd_y, rgt_x, rgt_y,
         ax, ay, fwd_x, fwd_y, rgt_x, rgt_y, grid_np,
         _SNIPER_FOV_RC_NP, _SNIPER_FOV_FWD, _SNIPER_FOV_RIGHT,
         _SNIPER_RAY_FLAT, _SNIPER_RAY_OFFSETS, _SNIPER_RAY_LENGTHS,
-        SNIPER_TILE_SIZE, cols, rows, view_size,
+        SNIPER_TILE_SIZE, tile_size, cols, rows, view_size,
     )
