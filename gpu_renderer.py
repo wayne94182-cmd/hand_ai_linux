@@ -342,9 +342,8 @@ class GPURenderer:
             else:
                 idx, w = idx_11, w11_masked
 
-            # 逐 Batch scatter
-            for b in range(B):
-                radar_flat[b].scatter_add_(0, idx[b], w[b])
+            # 一次性處理整個 Batch 的像素累加（消滅內層迴圈）
+            radar_flat.scatter_add_(1, idx, w)
 
         # 重塑為 (B, VIEW_SIZE, VIEW_SIZE)
         radar = radar_flat.view(B, VIEW_SIZE, VIEW_SIZE)
@@ -381,10 +380,9 @@ class GPURenderer:
         cos_a = torch.cos(angle_rad).view(B, 1, 1)  # (B, 1, 1)
         sin_a = torch.sin(angle_rad).view(B, 1, 1)  # (B, 1, 1)
 
-        # 135° 投影逆變換（從網格 → 局部坐標）
-        # dr = x_local, dc = y_local → ft = (dr+dc)/√2, rt = (dr-dc)/√2
+        # dr = x_local, dc = y_local → ft = (dr+dc)/√2, rt = (dc-dr)/√2
         ft_grid = (x_local + y_local) / SQRT2
-        rt_grid = (x_local - y_local) / SQRT2
+        rt_grid = (y_local - x_local) / SQRT2
 
         # 旋轉到世界坐標
         x_world = agent_x.view(B, 1, 1) + (ft_grid * cos_a - rt_grid * sin_a) * tile_size.view(B, 1, 1)
@@ -482,35 +480,41 @@ class GPURenderer:
         theta_quantized = ((theta + math.pi) / (2 * math.pi) * num_angles).long() % num_angles
 
         # 初始化 Shadow Mask
-        shadow_mask = torch.zeros(B, VIEW_SIZE, VIEW_SIZE, device=device)
+        shadow_mask = torch.zeros(B, VIEW_SIZE * VIEW_SIZE, device=device)
 
-        # 對每個角度 bin 進行徑向 cummax（向量化處理）
-        for angle_bin in range(num_angles):
-            # 找出屬於此角度的所有像素
-            angle_mask = (theta_quantized == angle_bin)  # (VIEW_SIZE, VIEW_SIZE)
+        # 展平地圖與極坐標
+        terrain_flat = terrain.view(B, -1)   # (B, V*V)
+        r_flat = r.view(-1)                  # (V*V,)
+        theta_flat = theta_quantized.view(-1) # (V*V,)
 
-            if not angle_mask.any():
-                continue
+        # 利用 torch.argsort 對距離排序
+        sort_idx = torch.argsort(r_flat)     # (V*V,)
 
-            # 提取此角度的距離與地形值
-            r_masked = r[angle_mask]  # (N_pixels,)
-            indices = angle_mask.nonzero(as_tuple=False)  # (N_pixels, 2)
+        # 取出排序後的地形值 (B, V*V) 和對應的 theta
+        terrain_sorted = terrain_flat[:, sort_idx]   # 使用 indexing 達到 gather 效果
+        theta_sorted = theta_flat[sort_idx]          # (V*V,)
 
-            # 按距離排序
-            sort_idx = torch.argsort(r_masked)
-            sorted_indices = indices[sort_idx]  # (N_pixels, 2)
+        # 這裡的巧妙之處：因為已經照 r 排序，sort_idx 本身就是一個絕對遞增的「徑向刻度」。
+        # 我們直接建構一個 (B, num_angles, V*V) 的網格，
+        # 在第 i 個位置（代表第 i 近的像素）填入 terrain_sorted[:, i]
+        # 然後沿著維度 2 (徑向) 作 cummax 就能傳遞陰影！
+        polar_grid = torch.zeros(B, num_angles, VIEW_SIZE * VIEW_SIZE, device=device)
 
-            # 提取排序後的地形值 (B, N_pixels)
-            terrain_values = terrain[:, sorted_indices[:, 0], sorted_indices[:, 1]]  # (B, N_pixels)
+        # 把地形映射到 (B, num_angles, V*V)
+        batch_idx = torch.arange(B, device=device).view(B, 1)
+        k_idx = torch.arange(VIEW_SIZE * VIEW_SIZE, device=device).view(1, -1)
+        polar_grid[batch_idx, theta_sorted.unsqueeze(0), k_idx] = terrain_sorted
 
-            # 累積最大值（牆壁遮擋）
-            cummax_values = torch.cummax(terrain_values, dim=1)[0]  # (B, N_pixels)
+        # 沿著徑向執行 torch.cummax，把牆壁造成的遮擋向外傳遞
+        cummax_values = torch.cummax(polar_grid, dim=2)[0]  # (B, num_angles, V*V)
 
-            # 回填到 Shadow Mask
-            for i, (y_idx, x_idx) in enumerate(sorted_indices):
-                shadow_mask[:, y_idx, x_idx] = cummax_values[:, i]
+        # 把計算完的陰影值抽回來 (B, V*V)
+        shadowed_sorted = cummax_values[batch_idx, theta_sorted.unsqueeze(0), k_idx]
 
-        return shadow_mask.clamp(0, 1)
+        # 用 scatter_ 把陰影填回原本 2D 網格的平坦化陣列中
+        shadow_mask.scatter_(1, sort_idx.unsqueeze(0).expand(B, -1), shadowed_sorted)
+
+        return shadow_mask.view(B, VIEW_SIZE, VIEW_SIZE).clamp(0, 1)
 
 
 # ═══════════════════════════════════════════════════════

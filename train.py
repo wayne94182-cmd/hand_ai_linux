@@ -644,20 +644,20 @@ def train(resume_path=None, forced_stage=None, target_stage_eps=50000, n_ai=2, u
         for flat in range(FLAT_BATCH):
             rews = buf_rewards[:, flat]
             vals = buf_values[:, flat]
-            dones = buf_dones[:, flat]
+            ep_dones = buf_dones[:, flat]
 
             # 分段計算 GAE（根據 done 標記切分 episode）
             episode_start = 0
             for t in range(ROLLOUT_STEPS):
-                if dones[t] or t == ROLLOUT_STEPS - 1:
+                if ep_dones[t] or t == ROLLOUT_STEPS - 1:
                     # Episode 結束，計算這段的 GAE
                     episode_end = t + 1
                     ep_rews = rews[episode_start:episode_end].tolist()
                     ep_vals = vals[episode_start:episode_end].tolist()
 
                     # Bootstrap: done 時 last_value=0，否則使用最後的 value
-                    last_val = 0.0 if dones[t] else ep_vals[-1]
-                    ep_advs = compute_gae(ep_rews, ep_vals, last_value=last_val, truncated=not dones[t])
+                    last_val = 0.0 if ep_dones[t] else ep_vals[-1]
+                    ep_advs = compute_gae(ep_rews, ep_vals, last_value=last_val, truncated=not ep_dones[t])
                     ep_rets = [a + v for a, v in zip(ep_advs, ep_vals)]
 
                     buf_advantages[episode_start:episode_end, flat] = ep_advs
@@ -838,28 +838,35 @@ def train(resume_path=None, forced_stage=None, target_stage_eps=50000, n_ai=2, u
 
             t_actor_loss = total_actor.mean()
 
-            # Critic（需按 team 分組）
+            # Critic（需按 team 分組，還原為 B_env 維度進行 Team Pooling）
             # 移除 detach()，讓 Critic 梯度能回傳到 CNN（修復 Task 3）
-            feat_d = feat_flat   # (TB, HIDDEN_SIZE)
+            # feat_all 的形狀為 (ROLLOUT_STEPS, FLAT_BATCH, HIDDEN_SIZE)
+            # FLAT_BATCH = n_ai * NUM_ENVS
+            feat_env = feat_all.view(ROLLOUT_STEPS, n_ai, NUM_ENVS, HIDDEN_SIZE).transpose(1, 2).reshape(ROLLOUT_STEPS * NUM_ENVS, n_ai, HIDDEN_SIZE)
+            
+            # 從 precomputed flat_team_ids 推導每個 AI 的 team (以 j=0 也就是第一個 env 為代表)
+            team0_mask_ai = torch.tensor([flat_team_ids[i * NUM_ENVS] == 0 for i in range(n_ai)], dtype=torch.bool, device=device)
+            team1_mask_ai = torch.tensor([flat_team_ids[i * NUM_ENVS] == 1 for i in range(n_ai)], dtype=torch.bool, device=device)
 
-            # 展平 team mask: (ROLLOUT_STEPS, FLAT_BATCH) → (TB,)
-            # 每個時間步的 team 分配都一樣，所以直接 expand
-            team0_exp = team0_mask_t.unsqueeze(0).expand(ROLLOUT_STEPS, -1).reshape(TB)
-            team1_exp = team1_mask_t.unsqueeze(0).expand(ROLLOUT_STEPS, -1).reshape(TB)
+            v_pred_env = torch.zeros(ROLLOUT_STEPS * NUM_ENVS, n_ai, device=device)
 
-            v_pred_flat = torch.zeros(TB, device=device)
+            if team0_mask_ai.any():
+                t0_feat = feat_env[:, team0_mask_ai, :]  # (B_env, N0, 256)
+                t1_feat = feat_env[:, team1_mask_ai, :] if team1_mask_ai.any() else None
+                v0_env = critic(t0_feat, t1_feat)  # (B_env,)
+                # 廣播給同隊所有 agent
+                v_pred_env[:, team0_mask_ai] = v0_env.unsqueeze(1)
 
-            if team0_exp.any():
-                t0_feat = feat_d[team0_exp]
-                t1_feat = feat_d[team1_exp] if team1_exp.any() else None
-                v0 = critic(t0_feat, t1_feat)
-                v_pred_flat[team0_exp] = v0
+            if team1_mask_ai.any():
+                t1_feat = feat_env[:, team1_mask_ai, :]
+                t0_feat = feat_env[:, team0_mask_ai, :] if team0_mask_ai.any() else None
+                v1_env = critic(t1_feat, t0_feat)
+                v_pred_env[:, team1_mask_ai] = v1_env.unsqueeze(1)
 
-            if team1_exp.any():
-                t1_feat = feat_d[team1_exp]
-                t0_feat = feat_d[team0_exp] if team0_exp.any() else None
-                v1 = critic(t1_feat, t0_feat)
-                v_pred_flat[team1_exp] = v1
+            # 將 v_pred_env 變換回 (TB,)
+            # (ROLLOUT_STEPS * NUM_ENVS, n_ai) -> (ROLLOUT_STEPS, NUM_ENVS, n_ai)
+            # transpose(1, 2) -> (ROLLOUT_STEPS, n_ai, NUM_ENVS) -> reshape(TB)
+            v_pred_flat = v_pred_env.view(ROLLOUT_STEPS, NUM_ENVS, n_ai).transpose(1, 2).reshape(TB)
 
             critic_l = (v_pred_flat - ret_flat).pow(2)
             t_critic_loss = critic_l.mean()
