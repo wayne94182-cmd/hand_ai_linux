@@ -24,7 +24,7 @@ from tqdm import tqdm
 from ai import ConvLSTM, TeamPoolingCritic, CommHandler, HIDDEN_SIZE, NUM_COMM, NUM_ACTIONS_DISCRETE
 from game import GameEnv, get_stage_spec
 from game.env import NUM_CHANNELS, NUM_SCALARS
-from game.config import VIEW_SIZE
+from game.config import VIEW_SIZE, ROWS, COLS
 
 # GPU 渲染器（僅在非 render_mode 時使用）
 from gpu_renderer import GPURenderer, pack_raw_states_to_tensors
@@ -369,10 +369,22 @@ def train(resume_path=None, forced_stage=None, target_stage_eps=50000, n_ai=2, u
         model.eval()
 
         # 固定步數採樣：預分配緩衝區
-        # 修正：GPU 渲染模式下只存座標，不存圖片！
+        # 修正：GPU 渲染模式下使用 NumPy Array 存座標，徹底消除 GC 災難！
         if use_gpu_renderer:
-            # 存儲 raw_state座標（輕量級）
-            buf_raw_states = []  # List[List[Dict]]，每個時間步存 FLAT_BATCH 個 raw_state
+            # 預先分配 NumPy 緩衝區存儲座標（避免 Dictionary 碎片化）
+            buf_agent_poses = np.zeros((ROLLOUT_STEPS, FLAT_BATCH, 4), dtype=np.float32)  # [x, y, angle, is_sniper]
+            buf_ally_poses = np.zeros((ROLLOUT_STEPS, FLAT_BATCH, MAX_ALLIES, 3), dtype=np.float32)
+            buf_ally_mask = np.zeros((ROLLOUT_STEPS, FLAT_BATCH, MAX_ALLIES), dtype=bool)
+            buf_enemy_poses = np.zeros((ROLLOUT_STEPS, FLAT_BATCH, MAX_ENEMIES, 3), dtype=np.float32)
+            buf_enemy_mask = np.zeros((ROLLOUT_STEPS, FLAT_BATCH, MAX_ENEMIES), dtype=bool)
+            buf_item_poses = np.zeros((ROLLOUT_STEPS, FLAT_BATCH, MAX_ITEMS, 3), dtype=np.float32)
+            buf_item_mask = np.zeros((ROLLOUT_STEPS, FLAT_BATCH, MAX_ITEMS), dtype=bool)
+            buf_threat_poses = np.zeros((ROLLOUT_STEPS, FLAT_BATCH, MAX_THREATS, 3), dtype=np.float32)
+            buf_threat_mask = np.zeros((ROLLOUT_STEPS, FLAT_BATCH, MAX_THREATS), dtype=bool)
+            buf_sound_waves = np.zeros((ROLLOUT_STEPS, FLAT_BATCH, MAX_SOUNDS, 4), dtype=np.float32)
+            buf_sound_mask = np.zeros((ROLLOUT_STEPS, FLAT_BATCH, MAX_SOUNDS), dtype=bool)
+            buf_grids = np.zeros((ROLLOUT_STEPS, FLAT_BATCH, ROWS, COLS), dtype=np.float32)
+            buf_poison_info = np.zeros((ROLLOUT_STEPS, FLAT_BATCH, 4), dtype=np.float32)
         else:
             # CPU 渲染模式：預存圖片
             buf_states = np.zeros((ROLLOUT_STEPS, FLAT_BATCH, NUM_CHANNELS, VIEW_SIZE, VIEW_SIZE), dtype=np.float32)
@@ -397,39 +409,94 @@ def train(resume_path=None, forced_stage=None, target_stage_eps=50000, n_ai=2, u
         for step in range(ROLLOUT_STEPS):
             # ── 分支 1：GPU 渲染模式（實驗性） ──
             if use_gpu_renderer:
-                # 1. 從 env_states 收集 raw_state（Dict 格式）
-                raw_states_flat = []
+                # 1. 從 env_states 收集 raw_state（Dict 格式）並存入 NumPy Arrays
                 sc_np = np.zeros((NUM_ENVS, n_ai, NUM_SCALARS), dtype=np.float32)
                 team_ids = np.zeros((NUM_ENVS, n_ai), dtype=np.int32)
+
                 for j in range(NUM_ENVS):
                     for i in range(n_ai):
                         rs = env_states[j][i]  # Dict: raw_state
-                        raw_states_flat.append(rs)
+                        flat = i * NUM_ENVS + j
+
+                        # 存入預配置 NumPy 緩衝區（取代 Dictionary append）
+                        buf_agent_poses[step, flat] = rs["agent_pose"]
+
+                        # Ally poses (padding)
+                        ally_list = rs["ally_poses"]
+                        n_allies = min(len(ally_list), MAX_ALLIES)
+                        buf_ally_mask[step, flat, :] = False
+                        if n_allies > 0:
+                            buf_ally_poses[step, flat, :n_allies] = ally_list[:n_allies]
+                            buf_ally_mask[step, flat, :n_allies] = True
+
+                        # Enemy poses (padding)
+                        enemy_list = rs["enemy_poses"]
+                        n_enemies = min(len(enemy_list), MAX_ENEMIES)
+                        buf_enemy_mask[step, flat, :] = False
+                        if n_enemies > 0:
+                            buf_enemy_poses[step, flat, :n_enemies] = enemy_list[:n_enemies]
+                            buf_enemy_mask[step, flat, :n_enemies] = True
+
+                        # Item poses (padding)
+                        item_list = rs["item_poses"]
+                        n_items = min(len(item_list), MAX_ITEMS)
+                        buf_item_mask[step, flat, :] = False
+                        if n_items > 0:
+                            buf_item_poses[step, flat, :n_items] = item_list[:n_items]
+                            buf_item_mask[step, flat, :n_items] = True
+
+                        # Threat poses (padding)
+                        threat_list = rs["threat_poses"]
+                        n_threats = min(len(threat_list), MAX_THREATS)
+                        buf_threat_mask[step, flat, :] = False
+                        if n_threats > 0:
+                            buf_threat_poses[step, flat, :n_threats] = threat_list[:n_threats]
+                            buf_threat_mask[step, flat, :n_threats] = True
+
+                        # Sound waves (padding)
+                        sound_list = rs["sound_waves"]
+                        n_sounds = min(len(sound_list), MAX_SOUNDS)
+                        buf_sound_mask[step, flat, :] = False
+                        if n_sounds > 0:
+                            buf_sound_waves[step, flat, :n_sounds] = sound_list[:n_sounds]
+                            buf_sound_mask[step, flat, :n_sounds] = True
+
+                        # Grid and poison info
+                        buf_grids[step, flat] = rs["grid"]
+                        buf_poison_info[step, flat] = rs["poison_info"]
+
+                        # Scalars and team_id
                         sc_np[j, i] = rs["scalars"]
                         team_ids[j, i] = int(rs["team_id"])
 
-                # 2. Padding 並打包成 Tensors
-                (agent_poses, ally_poses, ally_mask, enemy_poses, enemy_mask,
-                 item_poses, item_mask, threat_poses, threat_mask,
-                 sound_waves, sound_mask, grids, poison_info) = pack_raw_states_to_tensors(
-                    raw_states_flat, MAX_ALLIES, MAX_ENEMIES, MAX_ITEMS,
-                    MAX_THREATS, MAX_SOUNDS, device=device
-                )
+                # 2. 即時打包當前時間步的座標為 Tensors（只用於 Rollout 推理）
+                agent_poses_t = torch.from_numpy(buf_agent_poses[step]).to(device)
+                ally_poses_t = torch.from_numpy(buf_ally_poses[step]).to(device)
+                ally_mask_t = torch.from_numpy(buf_ally_mask[step]).to(device)
+                enemy_poses_t = torch.from_numpy(buf_enemy_poses[step]).to(device)
+                enemy_mask_t = torch.from_numpy(buf_enemy_mask[step]).to(device)
+                item_poses_t = torch.from_numpy(buf_item_poses[step]).to(device)
+                item_mask_t = torch.from_numpy(buf_item_mask[step]).to(device)
+                threat_poses_t = torch.from_numpy(buf_threat_poses[step]).to(device)
+                threat_mask_t = torch.from_numpy(buf_threat_mask[step]).to(device)
+                sound_waves_t = torch.from_numpy(buf_sound_waves[step]).to(device)
+                sound_mask_t = torch.from_numpy(buf_sound_mask[step]).to(device)
+                grids_t = torch.from_numpy(buf_grids[step]).to(device)
+                poison_info_t = torch.from_numpy(buf_poison_info[step]).to(device)
 
                 # 3. GPU 即時渲染（FLAT_BATCH, 10, 15, 15）
-                # 修正：直接在 GPU 端渲染，不轉回 CPU！
                 s_t = gpu_renderer.render_batch(
-                    agent_poses, ally_poses, ally_mask, enemy_poses, enemy_mask,
-                    item_poses, item_mask, threat_poses, threat_mask,
-                    sound_waves, sound_mask, grids, poison_info, device=device
+                    agent_poses_t, ally_poses_t, ally_mask_t,
+                    enemy_poses_t, enemy_mask_t,
+                    item_poses_t, item_mask_t,
+                    threat_poses_t, threat_mask_t,
+                    sound_waves_t, sound_mask_t,
+                    grids_t, poison_info_t, device=device
                 )  # 保持在 GPU 端
 
                 # 4. Scalars 展平並轉 Tensor
                 sc_flat = sc_np.transpose(1, 0, 2).reshape(FLAT_BATCH, NUM_SCALARS)
                 sc_t = torch.as_tensor(sc_flat, dtype=torch.float32, device=device)
-
-                # 5. 存儲 raw_states（只存座標，不存圖片！）
-                buf_raw_states.append(raw_states_flat)
 
             # ── 分支 2：原始 CPU 渲染模式（向後相容） ──
             else:
@@ -613,23 +680,30 @@ def train(resume_path=None, forced_stage=None, target_stage_eps=50000, n_ai=2, u
             chunk_size = 64  # 每次渲染 64 個時間步
             for t_start in range(0, ROLLOUT_STEPS, chunk_size):
                 t_end = min(t_start + chunk_size, ROLLOUT_STEPS)
-                chunk_raw_states = []
-                for t in range(t_start, t_end):
-                    chunk_raw_states.extend(buf_raw_states[t])
 
-                # Padding 並打包
-                (agent_poses, ally_poses, ally_mask, enemy_poses, enemy_mask,
-                 item_poses, item_mask, threat_poses, threat_mask,
-                 sound_waves, sound_mask, grids, poison_info) = pack_raw_states_to_tensors(
-                    chunk_raw_states, MAX_ALLIES, MAX_ENEMIES, MAX_ITEMS,
-                    MAX_THREATS, MAX_SOUNDS, device=device
-                )
+                # 從 NumPy 緩衝區直接打包為 Tensors（零拷貝，避免 Dictionary GC 災難）
+                agent_poses = torch.from_numpy(buf_agent_poses[t_start:t_end]).reshape(-1, 4).to(device)
+                ally_poses = torch.from_numpy(buf_ally_poses[t_start:t_end]).reshape(-1, MAX_ALLIES, 3).to(device)
+                ally_mask = torch.from_numpy(buf_ally_mask[t_start:t_end]).reshape(-1, MAX_ALLIES).to(device)
+                enemy_poses = torch.from_numpy(buf_enemy_poses[t_start:t_end]).reshape(-1, MAX_ENEMIES, 3).to(device)
+                enemy_mask = torch.from_numpy(buf_enemy_mask[t_start:t_end]).reshape(-1, MAX_ENEMIES).to(device)
+                item_poses = torch.from_numpy(buf_item_poses[t_start:t_end]).reshape(-1, MAX_ITEMS, 3).to(device)  # 修正：3 維 [x, y, type_id]
+                item_mask = torch.from_numpy(buf_item_mask[t_start:t_end]).reshape(-1, MAX_ITEMS).to(device)
+                threat_poses = torch.from_numpy(buf_threat_poses[t_start:t_end]).reshape(-1, MAX_THREATS, 3).to(device)
+                threat_mask = torch.from_numpy(buf_threat_mask[t_start:t_end]).reshape(-1, MAX_THREATS).to(device)
+                sound_waves = torch.from_numpy(buf_sound_waves[t_start:t_end]).reshape(-1, MAX_SOUNDS, 4).to(device)
+                sound_mask = torch.from_numpy(buf_sound_mask[t_start:t_end]).reshape(-1, MAX_SOUNDS).to(device)
+                grids = torch.from_numpy(buf_grids[t_start:t_end]).reshape(-1, ROWS, COLS).to(device)
+                poison_info = torch.from_numpy(buf_poison_info[t_start:t_end]).reshape(-1, 4).to(device)
 
                 # GPU 渲染
                 chunk_imgs = gpu_renderer.render_batch(
-                    agent_poses, ally_poses, ally_mask, enemy_poses, enemy_mask,
-                    item_poses, item_mask, threat_poses, threat_mask,
-                    sound_waves, sound_mask, grids, poison_info, device=device
+                    agent_poses, ally_poses, ally_mask,
+                    enemy_poses, enemy_mask,
+                    item_poses, item_mask,
+                    threat_poses, threat_mask,
+                    sound_waves, sound_mask,
+                    grids, poison_info, device=device
                 )  # ((t_end-t_start)*FLAT_BATCH, 10, 15, 15)
 
                 # 重塑並存入 bat_states
@@ -676,11 +750,20 @@ def train(resume_path=None, forced_stage=None, target_stage_eps=50000, n_ai=2, u
         bat_masks       = bat_masks.to(device, non_blocking=True)
 
         # Fix 7: 預計算每個 flat index 的 team_id（用最後一次觀測到的 team）
+        # 修正：相容 Tuple（CPU）與 Dict（GPU）兩種資料結構
         flat_team_ids = np.zeros(FLAT_BATCH, dtype=np.int32)
         for i in range(n_ai):
             for j in range(NUM_ENVS):
                 flat = i * NUM_ENVS + j
-                flat_team_ids[flat] = int(env_states[j][i][2]) if env_states[j][i] is not None else 0
+                state = env_states[j][i]
+                if state is None:
+                    flat_team_ids[flat] = 0
+                elif isinstance(state, dict):
+                    # GPU 渲染模式：Dictionary 格式
+                    flat_team_ids[flat] = int(state["team_id"])
+                else:
+                    # CPU 渲染模式：Tuple 格式 (view, scalars, team_id)
+                    flat_team_ids[flat] = int(state[2])
 
         # ── PPO 更新（seq_mode 向量化）──
         model.train()
@@ -756,7 +839,8 @@ def train(resume_path=None, forced_stage=None, target_stage_eps=50000, n_ai=2, u
             t_actor_loss = total_actor.mean()
 
             # Critic（需按 team 分組）
-            feat_d = feat_flat.detach()   # (TB, HIDDEN_SIZE)
+            # 移除 detach()，讓 Critic 梯度能回傳到 CNN（修復 Task 3）
+            feat_d = feat_flat   # (TB, HIDDEN_SIZE)
 
             # 展平 team mask: (ROLLOUT_STEPS, FLAT_BATCH) → (TB,)
             # 每個時間步的 team 分配都一樣，所以直接 expand
@@ -780,9 +864,10 @@ def train(resume_path=None, forced_stage=None, target_stage_eps=50000, n_ai=2, u
             critic_l = (v_pred_flat - ret_flat).pow(2)
             t_critic_loss = critic_l.mean()
 
-            # Actor + Critic backward（兩者都過 scaler，確保 AMP 正確縮放）
-            scaler.scale(t_actor_loss).backward()
-            scaler.scale(t_critic_loss * VALUE_COEF).backward()
+            # Task 3 修復：合併 Actor + Critic loss 一次 backward，讓梯度能回傳到共享 CNN
+            # 不能分別 backward，否則第二次會出現 "backward through the graph a second time" 錯誤
+            total_loss = t_actor_loss + t_critic_loss * VALUE_COEF
+            scaler.scale(total_loss).backward()
 
             scaler.unscale_(optimizer)
             scaler.unscale_(optimizer_critic)

@@ -200,7 +200,11 @@ class ConvLSTM(nn.Module):
 
     @torch.compiler.disable
     def _forward_seq(self, x, scalars, hidden, comm_in):
-        """整條時間序列 forward，CNN 平行分塊，LSTM 保持時序正確性。"""
+        """整條時間序列 forward，CNN 平行分塊，LSTM 原生批次處理（cuDNN 加速）。
+
+        Task 2 修復：移除 for t in range(T) 迴圈，改用 LSTM 原生時序處理，
+        釋放 cuDNN 平行運算能力（512 步從 512 次 kernel launch 降為 1 次）。
+        """
         T, B = x.shape[:2]
         N = T * B
 
@@ -212,49 +216,42 @@ class ConvLSTM(nn.Module):
         # 1. 攤平 CNN（分塊 Gradient Checkpointing 節省 VRAM，此處可完全平行）
         x_flat  = x.reshape(N, *x.shape[2:])          # (T*B, C, H, W)
         sc_flat = scalars.reshape(N, -1)              # (T*B, num_scalars)
-        
+
         # ⚠️ 啟動 Checkpoint 必須的 flag
         x_flat.requires_grad_(True)
-        
+
         # 分塊處理 CNN
         embed_flat = self._chunked_cnn_checkpoint(x_flat, sc_flat)
-        
+
         # 將 CNN 特徵轉回時序維度 (T, B, hidden_size)
         embed_seq = embed_flat.view(T, B, self.hidden_size)
 
-        # ====== 2. 修正致命 Bug：用 for 迴圈重建 Attention 與 LSTM 的時序依賴 ======
-        h_t, c_t = hidden
-        lstm_out_list = []
-        
-        # 判斷是否有有效的通訊張量，並預先準備 dummy 以防 Graph Break
-        has_comm = (comm_in is not None and comm_in.dim() == 4 and comm_in.size(2) > 0)
-        if has_comm:
-            _has_comm_scale = 1.0
-            _dummy_comm = None
+        # 2. Cross-Attention 通訊接收（訓練時 comm_in=None，直接跳過以釋放 cuDNN 效能）
+        if comm_in is not None and comm_in.dim() == 4 and comm_in.size(2) > 0:
+            # 有通訊時才處理（需用 for 迴圈，但訓練時永不執行此分支）
+            h_t, c_t = hidden
+            lstm_out_list = []
+            for t in range(T):
+                curr_embed = embed_seq[t]
+                prev_h = h_t.squeeze(0)
+                ctx = self._cross_attention(prev_h, comm_in[t])
+                fused = F.relu(self.fuse_norm(
+                    self.fc_fuse(torch.cat([curr_embed, ctx], dim=-1))
+                ))
+                lstm_in = fused.unsqueeze(0)
+                out_t, (h_t, c_t) = self.lstm(lstm_in, (h_t, c_t))
+                lstm_out_list.append(out_t.squeeze(0))
+            lstm_out = torch.stack(lstm_out_list, dim=0)
         else:
-            _has_comm_scale = 0.0
-            _dummy_comm = torch.zeros(B, 1, self.num_comm, device=x.device, dtype=x.dtype)
-
-        for t in range(T):
-            curr_embed = embed_seq[t]              # 當前步的 CNN 特徵 (B, 256)
-            prev_h = h_t.squeeze(0)                # 取出上一步「真實」的 h (B, 256)
-            
-            # Cross-Attention (使用 Dummy + Mask 乘法，防 Graph Break)
-            curr_comm = comm_in[t] if has_comm else _dummy_comm
-            ctx = self._cross_attention(prev_h, curr_comm) * _has_comm_scale
-                
-            # 融合特徵
+            # 無通訊時（訓練時走此分支）：直接用零向量填充 context，讓 LSTM 原生批次處理
+            ctx_zero = torch.zeros(T, B, self.hidden_size, device=x.device, dtype=x.dtype)
             fused = F.relu(self.fuse_norm(
-                self.fc_fuse(torch.cat([curr_embed, ctx], dim=-1))
-            ))
-            
-            # LSTM 單步前向傳播 (要求輸入維度 1, B, H)
-            lstm_in = fused.unsqueeze(0)
-            out_t, (h_t, c_t) = self.lstm(lstm_in, (h_t, c_t))
-            lstm_out_list.append(out_t.squeeze(0)) # 收集這步的結果 (B, 256)
-            
-        # 將 T 步的結果重新堆疊成 (T, B, 256)
-        lstm_out = torch.stack(lstm_out_list, dim=0)
+                self.fc_fuse(torch.cat([embed_seq, ctx_zero], dim=-1))
+            ))  # (T, B, 256)
+
+            # LSTM 原生時序處理（batch_first=False → 輸入 (T, B, H)）
+            # ⚡ cuDNN 平行運算 512 個時間步，單一 kernel launch！
+            lstm_out, (h_t, c_t) = self.lstm(fused, hidden)  # (T, B, 256)
 
         # 3. LayerNorm + 輸出頭（可再次平行運算）
         feat = self.lstm_norm(lstm_out)                            # (T, B, 256)
