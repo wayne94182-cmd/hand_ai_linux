@@ -435,7 +435,21 @@ class GameEnv:
     #  觀測生成（6ch + 22 scalars）
     # ═══════════════════════════════════════════════════════
 
-    def _get_local_view(self, agent) -> Tuple[np.ndarray, np.ndarray]:
+    def _get_local_view(self, agent):
+        """
+        根據 render_mode 回傳不同格式：
+        - render_mode=True: 完整渲染圖片（向後相容 watch.py）
+        - render_mode=False: 輕量級 raw_state（供 GPU 渲染器使用）
+        """
+        if self.render_mode:
+            # 保留原始 CPU 渲染邏輯（供觀戰使用）
+            return self._get_local_view_legacy(agent)
+        else:
+            # 新版：回傳輕量級 raw_state
+            return self._get_raw_state(agent)
+
+    def _get_local_view_legacy(self, agent) -> Tuple[np.ndarray, np.ndarray]:
+        """原始 CPU 渲染邏輯（向後相容）"""
         rad = math.radians(agent.angle)
         fwd_x, fwd_y = math.cos(rad), math.sin(rad)
         rgt_x, rgt_y = math.cos(rad + math.pi / 2), math.sin(rad + math.pi / 2)
@@ -651,6 +665,154 @@ class GameEnv:
         )
 
         return view, scalars, agent.team_id
+
+    def _get_raw_state(self, agent) -> dict:
+        """
+        輕量級 raw_state（供 GPU 渲染器使用）。
+        回傳純數值座標與純量，不包含任何圖片渲染。
+        """
+        ax, ay = agent.x, agent.y
+        wp = agent.active_weapon
+        use_sniper = wp is not None and getattr(wp, 'name', '') == 'sniper'
+
+        # ── Agent Pose ──
+        agent_pose = [ax, ay, agent.angle, 1.0 if use_sniper else 0.0]
+
+        # ── Allies (同隊、非自己) ──
+        ally_poses = []
+        for other in self.all_agents:
+            if not other.alive() or other is agent or other.team_id != agent.team_id:
+                continue
+            val = -1.0 if other.is_downed() else other.hp / 200.0
+            ally_poses.append([other.x, other.y, val])
+
+        # ── Enemies (不同隊) ──
+        enemy_poses = []
+        for other in self.all_agents:
+            if not other.alive() or other is agent or other.team_id == agent.team_id:
+                continue
+            val = -1.0 if other.is_downed() else other.hp / 200.0
+            enemy_poses.append([other.x, other.y, val])
+
+        # ── Items (武器/醫療包/手榴彈/彈藥) ──
+        item_poses = []
+        item_type_map = {"weapon": 0, "medkit": 1, "grenade": 2, "ammo": 3}
+        for item in self.ground_items:
+            type_id = item_type_map.get(item.item_type, 0)
+            item_poses.append([item.x, item.y, float(type_id)])
+
+        # ── Threats (子彈與手榴彈) ──
+        threat_poses = []
+        for p in self.projectiles:
+            if p.owner.team_id != agent.team_id:
+                hv = p.heatmap_value if hasattr(p, 'heatmap_value') else 0.5
+                threat_poses.append([p.x, p.y, hv])
+            else:
+                threat_poses.append([p.x, p.y, -0.2])
+
+        for g in self.grenades_list:
+            if not g.exploded:
+                val = 0.3 + 0.7 * (g.fuse_timer / max(1, g.fuse_frames))
+                threat_poses.append([g.x, g.y, val])
+
+        # ── Sound Waves ──
+        # 注意：radius 由 CPU 預先計算（current_frame - birth_frame）* expand_speed
+        sound_waves = []
+        for w in self.sound_waves:
+            if w.alive(self.frame_count):
+                # 計算當前半徑（expand_speed 定義在 game/audio.py）
+                age = self.frame_count - w.birth_frame
+                radius = age * w.expand_speed
+                if radius <= w.max_radius:
+                    sound_waves.append([w.x, w.y, radius, 1.0])
+
+        # ── Poison Zone ──
+        if self.stage_spec.has_poison_zone and self.poison_radius < float('inf'):
+            poison_info = [self.poison_cx, self.poison_cy, self.poison_radius, self.poison_radius_max]
+        else:
+            poison_info = [0.0, 0.0, 1e9, 1e9]  # 無毒圈標記
+
+        # ── Scalars（與原版相同） ──
+        def _weapon_onehot(slot_idx):
+            oh = [0.0] * 5
+            if slot_idx < len(agent.weapon_slots) and agent.weapon_slots[slot_idx] is not None:
+                wpn = agent.weapon_slots[slot_idx]
+                try:
+                    from game.items import WEAPON_TYPES
+                    wi = WEAPON_TYPES.index(wpn)
+                except ValueError:
+                    wi = 0
+                oh[wi] = 1.0
+            else:
+                oh[4] = 1.0  # empty
+            return oh
+
+        w1_oh = _weapon_onehot(0)
+        w2_oh = _weapon_onehot(1)
+        active_slot_f = float(agent.active_slot)
+
+        cur_wp = agent.active_weapon
+        if cur_wp is not None:
+            ammo_ratio = agent.ammo / max(1, cur_wp.mag_size)
+            reload_ratio = agent.reload_progress / max(1, cur_wp.reload_frames) if agent.reload_progress > 0 else 0.0
+        else:
+            ammo_ratio = agent.ammo / max(1, agent.max_ammo)
+            reload_ratio = 0.0
+
+        heal_ratio = agent.heal_progress / max(1, agent.heal_frames) if agent.heal_progress > 0 else 0.0
+        hp_ratio = agent.hp / max(1, agent.max_hp)
+        medkit_ratio = agent.medkits / max(1, agent.max_medkits)
+        grenade_ratio = agent.grenades / max(1, agent.max_grenades)
+        dash_ratio = agent.dash_cd / 160.0
+        hit_marker = 1.0 if getattr(agent, "hit_marker_timer", 0) > 0 else 0.0
+
+        # 最近隊友
+        rad = math.radians(agent.angle)
+        fwd_x, fwd_y = math.cos(rad), math.sin(rad)
+        alive_mates = [m for m in self.all_agents
+                       if not m.truly_dead() and not m.is_downed()
+                       and m is not agent and m.team_id == agent.team_id]
+        norm_ft = 0.0
+        norm_rt = 0.0
+        has_ally = 0.0
+        if alive_mates:
+            has_ally = 1.0
+            closest = min(alive_mates, key=lambda m: math.hypot(m.x - ax, m.y - ay))
+            dx = closest.x - ax
+            dy = closest.y - ay
+            rgt_x = math.cos(rad + math.pi / 2)
+            rgt_y = math.sin(rad + math.pi / 2)
+            cft = (dx * fwd_x + dy * fwd_y) / TILE_SIZE
+            crt = (dx * rgt_x + dy * rgt_y) / TILE_SIZE
+            norm_ft = float(np.clip(cft / self.grid_cols, -1.0, 1.0))
+            norm_rt = float(np.clip(crt / self.grid_rows, -1.0, 1.0))
+
+        is_downed_f = 1.0 if agent.is_downed() else 0.0
+        revive_ratio = agent.revive_progress / max(1, agent.revive_frames) if agent.is_downed() else 0.0
+
+        scalars = np.array(
+            w1_oh + w2_oh + [
+                active_slot_f, ammo_ratio, reload_ratio, heal_ratio,
+                hp_ratio, medkit_ratio, grenade_ratio, dash_ratio,
+                hit_marker, norm_ft, norm_rt, has_ally,
+                is_downed_f, revive_ratio,
+                agent.ammo_boxes / max(1, agent.max_ammo_boxes),
+            ],
+            dtype=np.float32,
+        )
+
+        return {
+            "agent_pose": agent_pose,
+            "ally_poses": ally_poses,
+            "enemy_poses": enemy_poses,
+            "item_poses": item_poses,
+            "threat_poses": threat_poses,
+            "sound_waves": sound_waves,
+            "grid": self.grid_np.copy(),  # 地圖網格（NumPy array）
+            "poison_info": poison_info,
+            "scalars": scalars,
+            "team_id": agent.team_id,
+        }
 
     # ═══════════════════════════════════════════════════════
     #  輔助查詢

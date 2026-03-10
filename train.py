@@ -26,6 +26,16 @@ from game import GameEnv, get_stage_spec
 from game.env import NUM_CHANNELS, NUM_SCALARS
 from game.config import VIEW_SIZE
 
+# GPU 渲染器（僅在非 render_mode 時使用）
+from gpu_renderer import GPURenderer, pack_raw_states_to_tensors
+
+# Padding 上限常數
+MAX_ALLIES = 3
+MAX_ENEMIES = 8
+MAX_ITEMS = 20
+MAX_THREATS = 32
+MAX_SOUNDS = 16
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -247,11 +257,15 @@ def load_checkpoint(path, model, critic, optimizer, optimizer_critic, device):
 #  主訓練迴圈
 # ═══════════════════════════════════════════════════════
 
-def train(resume_path=None, forced_stage=None, target_stage_eps=50000, n_ai=2):
+def train(resume_path=None, forced_stage=None, target_stage_eps=50000, n_ai=2, use_gpu_renderer=False):
+    """
+    新增參數：
+        use_gpu_renderer: 是否使用 GPU 端即時渲染（實驗性功能）
+    """
     global MANUAL_STOP
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    logger.info(f"訓練裝置: {device}, N_AI={n_ai}")
+    logger.info(f"訓練裝置: {device}, N_AI={n_ai}, GPU_Renderer={use_gpu_renderer}")
 
     FLAT_BATCH = n_ai * NUM_ENVS
 
@@ -313,6 +327,14 @@ def train(resume_path=None, forced_stage=None, target_stage_eps=50000, n_ai=2):
     # ═══════════════════════════════════════════════════════
     vec_env.set_stage(current_stage)
 
+    # GPU 渲染器初始化（僅在啟用時）
+    gpu_renderer = None
+    if use_gpu_renderer:
+        # 假設所有地圖大小相同（從 config 讀取）
+        from game.config import ROWS, COLS
+        gpu_renderer = GPURenderer(map_rows=ROWS, map_cols=COLS)
+        logger.info(f"GPU 渲染器已啟用：map_size=({ROWS}, {COLS})")
+
     # LSTM 隱藏狀態：跨 batch 持續（只在 episode done 時清空）
     h = torch.zeros(1, FLAT_BATCH, HIDDEN_SIZE, device=device)
     c = torch.zeros(1, FLAT_BATCH, HIDDEN_SIZE, device=device)
@@ -367,22 +389,59 @@ def train(resume_path=None, forced_stage=None, target_stage_eps=50000, n_ai=2):
 
         # 固定步數採樣循環
         for step in range(ROLLOUT_STEPS):
-            # 1. 從 NUM_ENVS 個環境收集狀態
-            s_np = np.zeros((NUM_ENVS, n_ai, NUM_CHANNELS, VIEW_SIZE, VIEW_SIZE), dtype=np.float32)
-            sc_np = np.zeros((NUM_ENVS, n_ai, NUM_SCALARS), dtype=np.float32)
-            team_ids = np.zeros((NUM_ENVS, n_ai), dtype=np.int32)
-            for j in range(NUM_ENVS):
-                for i in range(n_ai):
-                    s_np[j, i] = env_states[j][i][0]
-                    sc_np[j, i] = env_states[j][i][1]
-                    team_ids[j, i] = int(env_states[j][i][2])
+            # ── 分支 1：GPU 渲染模式（實驗性） ──
+            if use_gpu_renderer:
+                # 1. 從 env_states 收集 raw_state（Dict 格式）
+                raw_states_flat = []
+                sc_np = np.zeros((NUM_ENVS, n_ai, NUM_SCALARS), dtype=np.float32)
+                team_ids = np.zeros((NUM_ENVS, n_ai), dtype=np.int32)
+                for j in range(NUM_ENVS):
+                    for i in range(n_ai):
+                        rs = env_states[j][i]  # Dict: raw_state
+                        raw_states_flat.append(rs)
+                        sc_np[j, i] = rs["scalars"]
+                        team_ids[j, i] = int(rs["team_id"])
 
-            # 2. 展平：先 AI index，再 env index
-            s_flat = s_np.transpose(1, 0, 2, 3, 4).reshape(FLAT_BATCH, NUM_CHANNELS, VIEW_SIZE, VIEW_SIZE)
-            sc_flat = sc_np.transpose(1, 0, 2).reshape(FLAT_BATCH, NUM_SCALARS)
+                # 2. Padding 並打包成 Tensors
+                (agent_poses, ally_poses, ally_mask, enemy_poses, enemy_mask,
+                 item_poses, item_mask, threat_poses, threat_mask,
+                 sound_waves, sound_mask, grids, poison_info) = pack_raw_states_to_tensors(
+                    raw_states_flat, MAX_ALLIES, MAX_ENEMIES, MAX_ITEMS,
+                    MAX_THREATS, MAX_SOUNDS, device=device
+                )
 
-            s_t = torch.as_tensor(s_flat, dtype=torch.float32, device=device)
-            sc_t = torch.as_tensor(sc_flat, dtype=torch.float32, device=device)
+                # 3. GPU 即時渲染（FLAT_BATCH, 10, 15, 15）
+                s_flat = gpu_renderer.render_batch(
+                    agent_poses, ally_poses, ally_mask, enemy_poses, enemy_mask,
+                    item_poses, item_mask, threat_poses, threat_mask,
+                    sound_waves, sound_mask, grids, poison_info, device=device
+                ).cpu().numpy()  # 轉回 NumPy 供後續存儲
+
+                # 4. Scalars 展平
+                sc_flat = sc_np.transpose(1, 0, 2).reshape(FLAT_BATCH, NUM_SCALARS)
+
+                # 5. 轉 Tensor 供模型前向傳播
+                s_t = torch.as_tensor(s_flat, dtype=torch.float32, device=device)
+                sc_t = torch.as_tensor(sc_flat, dtype=torch.float32, device=device)
+
+            # ── 分支 2：原始 CPU 渲染模式（向後相容） ──
+            else:
+                # 1. 從 NUM_ENVS 個環境收集狀態
+                s_np = np.zeros((NUM_ENVS, n_ai, NUM_CHANNELS, VIEW_SIZE, VIEW_SIZE), dtype=np.float32)
+                sc_np = np.zeros((NUM_ENVS, n_ai, NUM_SCALARS), dtype=np.float32)
+                team_ids = np.zeros((NUM_ENVS, n_ai), dtype=np.int32)
+                for j in range(NUM_ENVS):
+                    for i in range(n_ai):
+                        s_np[j, i] = env_states[j][i][0]
+                        sc_np[j, i] = env_states[j][i][1]
+                        team_ids[j, i] = int(env_states[j][i][2])
+
+                # 2. 展平：先 AI index，再 env index
+                s_flat = s_np.transpose(1, 0, 2, 3, 4).reshape(FLAT_BATCH, NUM_CHANNELS, VIEW_SIZE, VIEW_SIZE)
+                sc_flat = sc_np.transpose(1, 0, 2).reshape(FLAT_BATCH, NUM_SCALARS)
+
+                s_t = torch.as_tensor(s_flat, dtype=torch.float32, device=device)
+                sc_t = torch.as_tensor(sc_flat, dtype=torch.float32, device=device)
 
             # 3. 準備 comm_in — 只傳同 env、同 team、不同 agent (Fix 5)
             K = max(0, n_ai - 1)
@@ -786,7 +845,10 @@ if __name__ == "__main__":
     parser.add_argument("--n_ai", type=int, default=2,
                         choices=[1, 2, 3, 4],
                         help="每個環境的 learning agent 數量")
+    parser.add_argument("--use_gpu_renderer", action="store_true",
+                        help="啟用 GPU 端即時渲染（實驗性功能）")
     args = parser.parse_args()
 
     train(resume_path=args.resume, forced_stage=args.stage,
-          target_stage_eps=args.stage_eps, n_ai=args.n_ai)
+          target_stage_eps=args.stage_eps, n_ai=args.n_ai,
+          use_gpu_renderer=args.use_gpu_renderer)
