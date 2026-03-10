@@ -72,7 +72,7 @@ class Agent:
         self.grenades: int = 0
         self.max_grenades: int = 2
         self.ammo_boxes: int = 3
-        self.max_ammo_boxes: int = 5
+        self.max_ammo_boxes: int = 12  # Stage 2+ 提升至 12 個
 
         # 讀條狀態
         self.reload_progress: int = 0  # 當前換彈已累積幀數（0 = 未換彈）

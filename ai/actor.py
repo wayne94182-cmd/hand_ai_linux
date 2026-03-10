@@ -86,7 +86,7 @@ class ConvLSTM(nn.Module):
         c1   = F.relu(self.bn1(self.conv1(x)))
         c2   = F.relu(self.bn2(self.conv2(c1)))
         c3   = F.relu(self.bn3(self.conv3(c2)))
-        flat = c3.view(x.size(0), -1)
+        flat = c3.reshape(x.size(0), -1)  # reshape 支持非連續張量
         embed = F.relu(self.embed_norm(
             self.fc_embed(torch.cat([flat, scalars], dim=-1))
         ))

@@ -359,8 +359,8 @@ def train(resume_path=None, forced_stage=None, target_stage_eps=50000, n_ai=2):
 
         # 統計信息
         total_episode_count = 0
-        env_downs = [0] * NUM_ENVS
-        env_wins = [0] * NUM_ENVS
+        # 記錄本次 rollout 中完成的所有 episode 的統計 (down_count, is_win)
+        completed_episodes = []
 
         # 固定步數採樣循環
         for step in range(ROLLOUT_STEPS):
@@ -477,10 +477,11 @@ def train(resume_path=None, forced_stage=None, target_stage_eps=50000, n_ai=2):
 
                 # 環境 done 時立刻 reset（無縫接軌）
                 if dones[j]:
-                    # 統計信息
+                    # 統計信息：記錄完成的 episode
                     total_episode_count += 1
-                    env_downs[j] += infos[j].get("down_count", 0)
-                    env_wins[j] += 1 if infos[j].get("ai_win", False) else 0
+                    down_count = infos[j].get("down_count", 0)
+                    is_win = 1 if infos[j].get("ai_win", False) else 0
+                    completed_episodes.append((down_count, is_win))
 
                     # 立刻重置環境
                     next_env_states[j] = new_all_states[j]
@@ -496,6 +497,23 @@ def train(resume_path=None, forced_stage=None, target_stage_eps=50000, n_ai=2):
                     next_env_states[j] = all_states[j]
 
             env_states = next_env_states
+
+        # ── Rollout 結束統計：包含未完成的 episode ──
+        # 對於沒有在 rollout 中 done 的環境，記錄當前狀態作為統計樣本
+        for j in range(NUM_ENVS):
+            # 檢查這個環境在 rollout 期間是否有 done
+            # buf_dones 形狀：(ROLLOUT_STEPS, FLAT_BATCH)
+            # 檢查這個環境的任意一個 AI 是否有 done（同一環境的所有 AI 會同時 done）
+            flat_start = 0 * NUM_ENVS + j  # 第一個 AI 在這個環境的 flat index
+            env_had_done = np.any(buf_dones[:, flat_start])
+            if not env_had_done:
+                # 這個環境在整個 rollout 中沒有完成任何 episode
+                # 使用最後一幀的 info 作為「進行中」的統計
+                # 注意：infos[j] 是最後一步的 info
+                down_count = infos[j].get("down_count", 0)
+                is_win = 1 if infos[j].get("ai_win", False) else 0
+                # 記錄為「進行中的 episode」統計（用於顯示當前表現）
+                completed_episodes.append((down_count, is_win))
 
         # ── GAE（固定步數，處理跨 episode 邊界）──
         buf_advantages = np.zeros((ROLLOUT_STEPS, FLAT_BATCH), dtype=np.float32)
@@ -708,8 +726,15 @@ def train(resume_path=None, forced_stage=None, target_stage_eps=50000, n_ai=2):
             avg_rew_per_env.append(env_total / n_ai)
         avg_rew = float(np.mean(avg_rew_per_env))
 
-        for d, w in zip(env_downs, env_wins):
+        # 將本次 rollout 中完成的所有 episode 加入滾動統計
+        for d, w in completed_episodes:
             rolling_win.append((d, w))
+
+        # DEBUG: 記錄本次 batch 完成的 episode 數量
+        if batch_ep % 100 == 0:
+            done_count = sum(1 for d, w in completed_episodes if w == 1 or w == 0)  # 實際 done 的
+            in_progress_count = len(completed_episodes) - done_count  # 進行中的（實際上現在都算進去了）
+            logger.info(f"[DEBUG] Batch {batch_ep}: completed_episodes={len(completed_episodes)}, rolling_win size={len(rolling_win)}")
 
         roll_list = list(rolling_win)
         total_ep = len(roll_list)

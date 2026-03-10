@@ -250,12 +250,19 @@ class GameEnv:
             team_str = "ai" if i == 0 else f"ai_{i}"
             a = Agent(spawns[idx][0], spawns[idx][1], color, team_str, bot_type="learning")
             a.team_id = tid
-            # 出生武器：PISTOL
-            a.weapon_slots = [PISTOL]
-            a.active_slot = 0
-            a.ammo = PISTOL.mag_size
-            a.max_ammo = PISTOL.mag_size
-            a.reload_delay = PISTOL.reload_frames
+            # 出生武器：Stage 0-1 有 PISTOL，Stage 2+ 需要自己撿
+            if self.stage_id <= 1:
+                a.weapon_slots = [PISTOL]
+                a.active_slot = 0
+                a.ammo = PISTOL.mag_size
+                a.max_ammo = PISTOL.mag_size
+                a.reload_delay = PISTOL.reload_frames
+            else:
+                a.weapon_slots = []  # Stage 2+ 無初始武器
+                a.active_slot = 0
+                a.ammo = 0
+                a.max_ammo = 0
+                a.reload_delay = 0
             # 身體參數 log-uniform 採樣
             spec = self.stage_spec
             a.body_speed_mult = _sample_log_uniform(*spec.body_speed_range)
