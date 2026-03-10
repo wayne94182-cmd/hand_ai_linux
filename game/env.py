@@ -144,11 +144,12 @@ def _sample_log_uniform(lo: float, hi: float) -> float:
 
 class GameEnv:
     def __init__(self, render_mode=False, stage_id=0, show_fov=True,
-                 n_learning_agents=1):
+                 n_learning_agents=1, use_gpu_renderer=False):
         self.render_mode = render_mode
         self.stage_id = stage_id
         self.show_fov = show_fov
         self.n_learning_agents = n_learning_agents
+        self.use_gpu_renderer = use_gpu_renderer
 
         self.bullet_damage = GameConfig.BULLET_DAMAGE
         self.enemy_damage = GameConfig.BULLET_DAMAGE
@@ -437,16 +438,14 @@ class GameEnv:
 
     def _get_local_view(self, agent):
         """
-        根據 render_mode 回傳不同格式：
-        - render_mode=True: 完整渲染圖片（向後相容 watch.py）
-        - render_mode=False: 輕量級 raw_state（供 GPU 渲染器使用）
+        相容設計：
+        - use_gpu_renderer=True: 回傳輕量級 raw_state 字典 (供 GPU 渲染)
+        - use_gpu_renderer=False: 回傳傳統 (view, scalars, team_id) 元組 (CPU 渲染)
         """
-        if self.render_mode:
-            # 保留原始 CPU 渲染邏輯（供觀戰使用）
-            return self._get_local_view_legacy(agent)
-        else:
-            # 新版：回傳輕量級 raw_state
+        if getattr(self, 'use_gpu_renderer', False):
             return self._get_raw_state(agent)
+        else:
+            return self._get_local_view_legacy(agent)
 
     def _get_local_view_legacy(self, agent) -> Tuple[np.ndarray, np.ndarray]:
         """原始 CPU 渲染邏輯（向後相容）"""

@@ -438,12 +438,12 @@ class GPURenderer:
         # 標準化距離：1.0 - dist/radius
         poison_value = torch.clamp(1.0 - dist_self / torch.clamp(radius, min=1.0), -1.0, 1.0)  # (B,)
 
-        # 廣播到整個視野
-        poison_ch = poison_value.view(B, 1, 1).expand(B, VIEW_SIZE, VIEW_SIZE)
-
         # 若 radius 為無限大（無毒圈），填充 1.0
         no_poison = (radius >= 1e9)  # (B,)
-        poison_ch[no_poison] = 1.0
+        poison_value = torch.where(no_poison, torch.tensor(1.0, device=device), poison_value)
+        
+        # 廣播到整個視野
+        poison_ch = poison_value.view(B, 1, 1).expand(B, VIEW_SIZE, VIEW_SIZE)
 
         return poison_ch
 

@@ -310,7 +310,8 @@ def train(resume_path=None, forced_stage=None, target_stage_eps=50000, n_ai=2, u
 
     vec_env = VecEnv(
         env_fn=lambda sid, nai: GameEnv(render_mode=False, stage_id=sid,
-                                        n_learning_agents=nai),
+                                        n_learning_agents=nai,
+                                        use_gpu_renderer=use_gpu_renderer),
         num_envs=NUM_ENVS,
         stage_id=current_stage,
         n_ai=n_ai,
@@ -385,6 +386,11 @@ def train(resume_path=None, forced_stage=None, target_stage_eps=50000, n_ai=2, u
             buf_sound_mask = np.zeros((ROLLOUT_STEPS, FLAT_BATCH, MAX_SOUNDS), dtype=bool)
             buf_grids = np.zeros((ROLLOUT_STEPS, FLAT_BATCH, ROWS, COLS), dtype=np.float32)
             buf_poison_info = np.zeros((ROLLOUT_STEPS, FLAT_BATCH, 4), dtype=np.float32)
+
+            # GPU 模式也需要緩存圖片！避免 PPO 更新時重新渲染（雙重渲染災難）
+            # 使用 Tensor 存在 GPU 上，避免 CPU↔GPU 搬運
+            buf_states_gpu = torch.zeros((ROLLOUT_STEPS, FLAT_BATCH, NUM_CHANNELS, VIEW_SIZE, VIEW_SIZE),
+                                         dtype=torch.float32, device=device)
         else:
             # CPU 渲染模式：預存圖片
             buf_states = np.zeros((ROLLOUT_STEPS, FLAT_BATCH, NUM_CHANNELS, VIEW_SIZE, VIEW_SIZE), dtype=np.float32)
@@ -469,32 +475,37 @@ def train(resume_path=None, forced_stage=None, target_stage_eps=50000, n_ai=2, u
                         sc_np[j, i] = rs["scalars"]
                         team_ids[j, i] = int(rs["team_id"])
 
-                # 2. 即時打包當前時間步的座標為 Tensors（只用於 Rollout 推理）
-                agent_poses_t = torch.from_numpy(buf_agent_poses[step]).to(device)
-                ally_poses_t = torch.from_numpy(buf_ally_poses[step]).to(device)
-                ally_mask_t = torch.from_numpy(buf_ally_mask[step]).to(device)
-                enemy_poses_t = torch.from_numpy(buf_enemy_poses[step]).to(device)
-                enemy_mask_t = torch.from_numpy(buf_enemy_mask[step]).to(device)
-                item_poses_t = torch.from_numpy(buf_item_poses[step]).to(device)
-                item_mask_t = torch.from_numpy(buf_item_mask[step]).to(device)
-                threat_poses_t = torch.from_numpy(buf_threat_poses[step]).to(device)
-                threat_mask_t = torch.from_numpy(buf_threat_mask[step]).to(device)
-                sound_waves_t = torch.from_numpy(buf_sound_waves[step]).to(device)
-                sound_mask_t = torch.from_numpy(buf_sound_mask[step]).to(device)
-                grids_t = torch.from_numpy(buf_grids[step]).to(device)
-                poison_info_t = torch.from_numpy(buf_poison_info[step]).to(device)
+                # 2. 即時渲染當前步（用於推理決策）
+                # 優化：使用 non_blocking 傳輸加速
+                with torch.no_grad():
+                    agent_poses_t = torch.from_numpy(buf_agent_poses[step]).to(device, non_blocking=True)
+                    ally_poses_t = torch.from_numpy(buf_ally_poses[step]).to(device, non_blocking=True)
+                    ally_mask_t = torch.from_numpy(buf_ally_mask[step]).to(device, non_blocking=True)
+                    enemy_poses_t = torch.from_numpy(buf_enemy_poses[step]).to(device, non_blocking=True)
+                    enemy_mask_t = torch.from_numpy(buf_enemy_mask[step]).to(device, non_blocking=True)
+                    item_poses_t = torch.from_numpy(buf_item_poses[step]).to(device, non_blocking=True)
+                    item_mask_t = torch.from_numpy(buf_item_mask[step]).to(device, non_blocking=True)
+                    threat_poses_t = torch.from_numpy(buf_threat_poses[step]).to(device, non_blocking=True)
+                    threat_mask_t = torch.from_numpy(buf_threat_mask[step]).to(device, non_blocking=True)
+                    sound_waves_t = torch.from_numpy(buf_sound_waves[step]).to(device, non_blocking=True)
+                    sound_mask_t = torch.from_numpy(buf_sound_mask[step]).to(device, non_blocking=True)
+                    grids_t = torch.from_numpy(buf_grids[step]).to(device, non_blocking=True)
+                    poison_info_t = torch.from_numpy(buf_poison_info[step]).to(device, non_blocking=True)
 
-                # 3. GPU 即時渲染（FLAT_BATCH, 10, 15, 15）
-                s_t = gpu_renderer.render_batch(
-                    agent_poses_t, ally_poses_t, ally_mask_t,
-                    enemy_poses_t, enemy_mask_t,
-                    item_poses_t, item_mask_t,
-                    threat_poses_t, threat_mask_t,
-                    sound_waves_t, sound_mask_t,
-                    grids_t, poison_info_t, device=device
-                )  # 保持在 GPU 端
+                    # GPU 渲染並緩存
+                    s_t = gpu_renderer.render_batch(
+                        agent_poses_t, ally_poses_t, ally_mask_t,
+                        enemy_poses_t, enemy_mask_t,
+                        item_poses_t, item_mask_t,
+                        threat_poses_t, threat_mask_t,
+                        sound_waves_t, sound_mask_t,
+                        grids_t, poison_info_t, device=device
+                    )
 
-                # 4. Scalars 展平並轉 Tensor
+                    # 存入 GPU 緩存（PPO 更新時使用）
+                    buf_states_gpu[step] = s_t
+
+                # 3. Scalars
                 sc_flat = sc_np.transpose(1, 0, 2).reshape(FLAT_BATCH, NUM_SCALARS)
                 sc_t = torch.as_tensor(sc_flat, dtype=torch.float32, device=device)
 
@@ -673,44 +684,11 @@ def train(resume_path=None, forced_stage=None, target_stage_eps=50000, n_ai=2, u
             buf_advantages = (buf_advantages - a_mean) / a_std
 
         # ── 打包 batch tensor──
-        # 修正：GPU 渲染模式即時生成圖片，不從 Buffer 讀取！
         if use_gpu_renderer:
-            # 即時渲染所有時間步的圖片（分塊處理以節省 VRAM）
-            bat_states = torch.zeros(ROLLOUT_STEPS, FLAT_BATCH, NUM_CHANNELS, VIEW_SIZE, VIEW_SIZE, device=device)
-            chunk_size = 64  # 每次渲染 64 個時間步
-            for t_start in range(0, ROLLOUT_STEPS, chunk_size):
-                t_end = min(t_start + chunk_size, ROLLOUT_STEPS)
-
-                # 從 NumPy 緩衝區直接打包為 Tensors（零拷貝，避免 Dictionary GC 災難）
-                agent_poses = torch.from_numpy(buf_agent_poses[t_start:t_end]).reshape(-1, 4).to(device)
-                ally_poses = torch.from_numpy(buf_ally_poses[t_start:t_end]).reshape(-1, MAX_ALLIES, 3).to(device)
-                ally_mask = torch.from_numpy(buf_ally_mask[t_start:t_end]).reshape(-1, MAX_ALLIES).to(device)
-                enemy_poses = torch.from_numpy(buf_enemy_poses[t_start:t_end]).reshape(-1, MAX_ENEMIES, 3).to(device)
-                enemy_mask = torch.from_numpy(buf_enemy_mask[t_start:t_end]).reshape(-1, MAX_ENEMIES).to(device)
-                item_poses = torch.from_numpy(buf_item_poses[t_start:t_end]).reshape(-1, MAX_ITEMS, 3).to(device)  # 修正：3 維 [x, y, type_id]
-                item_mask = torch.from_numpy(buf_item_mask[t_start:t_end]).reshape(-1, MAX_ITEMS).to(device)
-                threat_poses = torch.from_numpy(buf_threat_poses[t_start:t_end]).reshape(-1, MAX_THREATS, 3).to(device)
-                threat_mask = torch.from_numpy(buf_threat_mask[t_start:t_end]).reshape(-1, MAX_THREATS).to(device)
-                sound_waves = torch.from_numpy(buf_sound_waves[t_start:t_end]).reshape(-1, MAX_SOUNDS, 4).to(device)
-                sound_mask = torch.from_numpy(buf_sound_mask[t_start:t_end]).reshape(-1, MAX_SOUNDS).to(device)
-                grids = torch.from_numpy(buf_grids[t_start:t_end]).reshape(-1, ROWS, COLS).to(device)
-                poison_info = torch.from_numpy(buf_poison_info[t_start:t_end]).reshape(-1, 4).to(device)
-
-                # GPU 渲染
-                chunk_imgs = gpu_renderer.render_batch(
-                    agent_poses, ally_poses, ally_mask,
-                    enemy_poses, enemy_mask,
-                    item_poses, item_mask,
-                    threat_poses, threat_mask,
-                    sound_waves, sound_mask,
-                    grids, poison_info, device=device
-                )  # ((t_end-t_start)*FLAT_BATCH, 10, 15, 15)
-
-                # 重塑並存入 bat_states
-                chunk_imgs = chunk_imgs.view(t_end - t_start, FLAT_BATCH, NUM_CHANNELS, VIEW_SIZE, VIEW_SIZE)
-                bat_states[t_start:t_end] = chunk_imgs
+            # GPU 模式：直接使用 Rollout 階段緩存的圖片（已在 GPU 上，零拷貝）
+            bat_states = buf_states_gpu  # (ROLLOUT_STEPS, FLAT_BATCH, 10, 15, 15)
         else:
-            # CPU 渲染模式：從 Buffer 讀取
+            # CPU 渲染模式：從 Buffer 讀取並傳輸到 GPU
             bat_states = torch.as_tensor(buf_states, dtype=torch.float32).to(device)
 
         # 其他 Tensor（零拷貝 + pin_memory 優化）
