@@ -394,6 +394,7 @@ def train(resume_path=None, forced_stage=None, target_stage_eps=50000, n_ai=2, u
         else:
             # CPU 渲染模式：預存圖片
             buf_states = np.zeros((ROLLOUT_STEPS, FLAT_BATCH, NUM_CHANNELS, VIEW_SIZE, VIEW_SIZE), dtype=np.float32)
+        buf_team_ids = np.zeros((ROLLOUT_STEPS, FLAT_BATCH), dtype=np.int32)
         buf_scalars = np.zeros((ROLLOUT_STEPS, FLAT_BATCH, NUM_SCALARS), dtype=np.float32)
         buf_actions = np.zeros((ROLLOUT_STEPS, FLAT_BATCH, NUM_ACTIONS_DISCRETE), dtype=np.float32)
         buf_values = np.zeros((ROLLOUT_STEPS, FLAT_BATCH), dtype=np.float32)
@@ -412,6 +413,8 @@ def train(resume_path=None, forced_stage=None, target_stage_eps=50000, n_ai=2, u
         completed_episodes = []
 
         # 固定步數採樣循環
+        start_h = h.clone().detach()
+        start_c = c.clone().detach()
         for step in range(ROLLOUT_STEPS):
             # ── 分支 1：GPU 渲染模式（實驗性） ──
             if use_gpu_renderer:
@@ -528,6 +531,9 @@ def train(resume_path=None, forced_stage=None, target_stage_eps=50000, n_ai=2, u
                 s_t = torch.as_tensor(s_flat, dtype=torch.float32, device=device)
                 sc_t = torch.as_tensor(sc_flat, dtype=torch.float32, device=device)
 
+            # 將這一步的 team_ids 存入 buffer
+            buf_team_ids[step] = team_ids.transpose(1, 0).reshape(FLAT_BATCH)
+
             # 3. 準備 comm_in — 只傳同 env、同 team、不同 agent (Fix 5)
             K = max(0, n_ai - 1)
             comm_in_np = np.zeros((FLAT_BATCH, K, NUM_COMM), dtype=np.float32)
@@ -557,8 +563,26 @@ def train(resume_path=None, forced_stage=None, target_stage_eps=50000, n_ai=2, u
                 logits = logits.float()
                 feat = feat.float()
 
-                # Fix 1: Critic 使用 feat.detach()
-                v = critic(feat.detach())  # (FLAT_BATCH,)
+                # Fix 3: 分 team 呼叫 Critic
+                feat_env = feat.detach().view(n_ai, NUM_ENVS, HIDDEN_SIZE).transpose(0, 1) # (NUM_ENVS, n_ai, HIDDEN_SIZE)
+                team_ids_t = torch.as_tensor(team_ids, dtype=torch.int32, device=device) # (NUM_ENVS, n_ai)
+                t0_mask = team_ids_t == 0
+                t1_mask = team_ids_t == 1
+                
+                N0 = t0_mask[0].sum().item()
+                N1 = t1_mask[0].sum().item()
+                
+                v_env_r = torch.zeros(NUM_ENVS, n_ai, device=device)
+                
+                t0_f = feat_env[t0_mask].view(NUM_ENVS, N0, HIDDEN_SIZE) if N0 > 0 else None
+                t1_f = feat_env[t1_mask].view(NUM_ENVS, N1, HIDDEN_SIZE) if N1 > 0 else None
+                
+                if N0 > 0:
+                    v_env_r[t0_mask] = critic(t0_f, t0_f, t1_f).flatten()
+                if N1 > 0:
+                    v_env_r[t1_mask] = critic(t1_f, t1_f, t0_f).flatten()
+                    
+                v = v_env_r.transpose(0, 1).reshape(FLAT_BATCH)
 
                 # Fix 2: Action Masking 在 rollout 取樣時
                 mask_t = torch.as_tensor(last_masks, dtype=torch.bool, device=device)
@@ -679,9 +703,18 @@ def train(resume_path=None, forced_stage=None, target_stage_eps=50000, n_ai=2, u
 
         # Normalize advantages
         if len(all_advs) > 1:
-            a_mean = float(np.mean(all_advs))
-            a_std = float(np.std(all_advs)) + 1e-8
-            buf_advantages = (buf_advantages - a_mean) / a_std
+            t0_idx = (buf_team_ids == 0)
+            t1_idx = (buf_team_ids == 1)
+            
+            if t0_idx.any():
+                a0_mean = float(np.mean(buf_advantages[t0_idx]))
+                a0_std = float(np.std(buf_advantages[t0_idx])) + 1e-8
+                buf_advantages[t0_idx] = (buf_advantages[t0_idx] - a0_mean) / a0_std
+                
+            if t1_idx.any():
+                a1_mean = float(np.mean(buf_advantages[t1_idx]))
+                a1_std = float(np.std(buf_advantages[t1_idx])) + 1e-8
+                buf_advantages[t1_idx] = (buf_advantages[t1_idx] - a1_mean) / a1_std
 
         # ── 打包 batch tensor──
         if use_gpu_renderer:
@@ -747,18 +780,12 @@ def train(resume_path=None, forced_stage=None, target_stage_eps=50000, n_ai=2, u
         model.train()
         critic.train()
 
-        # 預計算 team mask tensor（避免 PPO epoch 內重複建立）
-        team0_mask_t = torch.tensor([flat_team_ids[f] == 0 for f in range(FLAT_BATCH)],
-                                     dtype=torch.bool, device=device)
-        team1_mask_t = torch.tensor([flat_team_ids[f] == 1 for f in range(FLAT_BATCH)],
-                                     dtype=torch.bool, device=device)
-
         for _ in range(PPO_EPOCHS):
             optimizer.zero_grad()
             optimizer_critic.zero_grad()
 
-            h_tr = torch.zeros(1, FLAT_BATCH, HIDDEN_SIZE, device=device)
-            c_tr = torch.zeros(1, FLAT_BATCH, HIDDEN_SIZE, device=device)
+            h_tr = start_h.clone()
+            c_tr = start_c.clone()
 
             # 一次 forward 取代整個 for t 迴圈
             with torch.amp.autocast("cuda", enabled=use_amp):
@@ -822,28 +849,28 @@ def train(resume_path=None, forced_stage=None, target_stage_eps=50000, n_ai=2, u
             # FLAT_BATCH = n_ai * NUM_ENVS
             feat_env = feat_all.view(ROLLOUT_STEPS, n_ai, NUM_ENVS, HIDDEN_SIZE).transpose(1, 2).reshape(ROLLOUT_STEPS * NUM_ENVS, n_ai, HIDDEN_SIZE)
             
-            # 從 precomputed flat_team_ids 推導每個 AI 的 team (以 j=0 也就是第一個 env 為代表)
-            team0_mask_ai = torch.tensor([flat_team_ids[i * NUM_ENVS] == 0 for i in range(n_ai)], dtype=torch.bool, device=device)
-            team1_mask_ai = torch.tensor([flat_team_ids[i * NUM_ENVS] == 1 for i in range(n_ai)], dtype=torch.bool, device=device)
-
+            # 使用準確收集的 buf_team_ids 構建 Mask
+            team_ids_all = torch.as_tensor(buf_team_ids, dtype=torch.int32, device=device)
+            team_ids_env = team_ids_all.view(ROLLOUT_STEPS, n_ai, NUM_ENVS).transpose(1, 2).reshape(ROLLOUT_STEPS * NUM_ENVS, n_ai)
+            
+            t0_mask_all = team_ids_env == 0
+            t1_mask_all = team_ids_env == 1
+            
             v_pred_env = torch.zeros(ROLLOUT_STEPS * NUM_ENVS, n_ai, device=device)
-
-            if team0_mask_ai.any():
-                t0_feat = feat_env[:, team0_mask_ai, :]  # (B_env, N0, 256)
-                t1_feat = feat_env[:, team1_mask_ai, :] if team1_mask_ai.any() else None
-                v0_env = critic(t0_feat, t1_feat)  # (B_env,)
-                # 廣播給同隊所有 agent
-                v_pred_env[:, team0_mask_ai] = v0_env.unsqueeze(1)
-
-            if team1_mask_ai.any():
-                t1_feat = feat_env[:, team1_mask_ai, :]
-                t0_feat = feat_env[:, team0_mask_ai, :] if team0_mask_ai.any() else None
-                v1_env = critic(t1_feat, t0_feat)
-                v_pred_env[:, team1_mask_ai] = v1_env.unsqueeze(1)
-
+            
+            N0 = t0_mask_all[0].sum().item()
+            N1 = t1_mask_all[0].sum().item()
+            
+            t0_feat = feat_env[t0_mask_all].view(ROLLOUT_STEPS * NUM_ENVS, N0, HIDDEN_SIZE) if N0 > 0 else None
+            t1_feat = feat_env[t1_mask_all].view(ROLLOUT_STEPS * NUM_ENVS, N1, HIDDEN_SIZE) if N1 > 0 else None
+            
+            if N0 > 0:
+                v_pred_env[t0_mask_all] = critic(t0_feat, t0_feat, t1_feat).flatten()
+            if N1 > 0:
+                v_pred_env[t1_mask_all] = critic(t1_feat, t1_feat, t0_feat).flatten()
+            
             # 將 v_pred_env 變換回 (TB,)
-            # (ROLLOUT_STEPS * NUM_ENVS, n_ai) -> (ROLLOUT_STEPS, NUM_ENVS, n_ai)
-            # transpose(1, 2) -> (ROLLOUT_STEPS, n_ai, NUM_ENVS) -> reshape(TB)
+            # (ROLLOUT_STEPS * NUM_ENVS, n_ai) -> (ROLLOUT_STEPS, NUM_ENVS, n_ai) -> reshape(TB)
             v_pred_flat = v_pred_env.view(ROLLOUT_STEPS, NUM_ENVS, n_ai).transpose(1, 2).reshape(TB)
 
             critic_l = (v_pred_flat - ret_flat).pow(2)
