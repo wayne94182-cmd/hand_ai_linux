@@ -130,9 +130,61 @@ def _project_items_njit(
                 _inject_value_njit(channel, r_f, c_f, item_values[i], view_size)
 
 
-# 道具生成權重
+# 道具生成權重與比例
 _WEAPON_WEIGHTS = [0.2, 0.35, 0.30, 0.15]       # PISTOL, RIFLE, SHOTGUN, SNIPER
-_ITEM_TYPE_WEIGHTS = [0.30, 0.15, 0.15, 0.40] # weapon, medkit, grenade, ammo
+_ITEM_TYPE_RATIOS = [0.35, 0.15, 0.15, 0.35]   # weapon, medkit, grenade, ammo 的比例
+
+def _generate_item_pool(n_total_items: int) -> list:
+    """
+    根據總物品數量，按照固定比例生成物品池。
+    確保比例分配而不是機率隨機。
+
+    Args:
+        n_total_items: 要生成的總物品數量
+
+    Returns:
+        物品類型列表，每個元素為 ("weapon"|"medkit"|"grenade"|"ammo", weapon_spec_or_None)
+    """
+    # 計算各類物品數量（使用 round 減少誤差）
+    n_weapons = round(n_total_items * _ITEM_TYPE_RATIOS[0])
+    n_medkits = round(n_total_items * _ITEM_TYPE_RATIOS[1])
+    n_grenades = round(n_total_items * _ITEM_TYPE_RATIOS[2])
+    n_ammo = round(n_total_items * _ITEM_TYPE_RATIOS[3])
+
+    # 處理四捨五入誤差，優先分配給數量最多的類別（武器和彈藥）
+    total_allocated = n_weapons + n_medkits + n_grenades + n_ammo
+    remainder = n_total_items - total_allocated
+
+    if remainder > 0:
+        # 有剩餘，優先分配給武器和彈藥（各一半）
+        n_weapons += remainder // 2
+        n_ammo += remainder - (remainder // 2)
+    elif remainder < 0:
+        # 分配過多，從彈藥中扣除
+        n_ammo += remainder  # remainder 是負數
+
+    # 確保所有數量非負
+    n_weapons = max(0, n_weapons)
+    n_medkits = max(0, n_medkits)
+    n_grenades = max(0, n_grenades)
+    n_ammo = max(0, n_ammo)
+
+    item_pool = []
+
+    # 生成武器（按武器類型權重分配）
+    for _ in range(n_weapons):
+        weapon_spec = random.choices(WEAPON_TYPES, weights=_WEAPON_WEIGHTS, k=1)[0]
+        item_pool.append(("weapon", weapon_spec))
+
+    # 生成其他物品
+    item_pool.extend([("medkit", None)] * n_medkits)
+    item_pool.extend([("grenade", None)] * n_grenades)
+    item_pool.extend([("ammo", None)] * n_ammo)
+
+    # 打亂順序
+    random.shuffle(item_pool)
+
+    return item_pool
 
 _MAP_POOL = {"small": SMALL_MAPS, "medium": MEDIUM_MAPS, "large": LARGE_MAPS}
 
@@ -315,27 +367,51 @@ class GameEnv:
         self.frame_count = 0
         self._last_info = {}
 
-        # 散布地面道具
+        # 散布地面道具（新版：確保比例分配）
         self.ground_items = []
-        n_items = (n_la + self.stage_spec.enemy_count) * 2
-        if empty_spots:
-            for _ in range(n_items):
-                spot = random.choice(empty_spots)
-                roll = random.random()
-                cum = 0.0
-                item = None
-                for weight, factory in [
-                    (_ITEM_TYPE_WEIGHTS[0], lambda s=spot: GroundItem(float(s[0]), float(s[1]), "weapon", weapon_spec=random.choices(WEAPON_TYPES, weights=_WEAPON_WEIGHTS, k=1)[0])),
-                    (_ITEM_TYPE_WEIGHTS[1], lambda s=spot: GroundItem(float(s[0]), float(s[1]), "medkit")),
-                    (_ITEM_TYPE_WEIGHTS[2], lambda s=spot: GroundItem(float(s[0]), float(s[1]), "grenade")),
-                    (_ITEM_TYPE_WEIGHTS[3], lambda s=spot: GroundItem(float(s[0]), float(s[1]), "ammo")),
-                ]:
-                    cum += weight
-                    if roll < cum:
-                        item = factory()
-                        break
-                if item:
-                    self.ground_items.append(item)
+
+        # 計算物品總數量：考慮玩家數量與地圖大小
+        n_players = n_la + self.stage_spec.enemy_count + self.stage_spec.teammate_count
+
+        # 計算地圖可用空間（空地格子數量）
+        map_empty_cells = len(empty_spots)
+
+        # 動態計算物品數量
+        # 基礎公式：玩家數量 * 2 + 地圖大小加成
+        base_items = n_players * 2
+
+        # 地圖大小加成：小地圖 +0，中地圖 +10，大地圖 +20
+        if map_empty_cells < 200:  # 小地圖（約 14x14 或更小）
+            map_bonus = 0
+        elif map_empty_cells < 600:  # 中地圖（約 24x24 或更小）
+            map_bonus = 5
+        else:  # 大地圖
+            map_bonus = 40
+
+        n_items = base_items + map_bonus
+
+        # 確保至少有足夠空間放置物品
+        n_items = min(n_items, len(empty_spots))
+
+        if n_items > 0 and empty_spots:
+            # 生成按比例分配的物品池
+            item_pool = _generate_item_pool(n_items)
+
+            # 隨機選擇位置並放置物品
+            selected_spots = random.sample(empty_spots, n_items)
+            for i, (item_type, weapon_spec) in enumerate(item_pool):
+                spot = selected_spots[i]
+                if item_type == "weapon":
+                    item = GroundItem(float(spot[0]), float(spot[1]), "weapon", weapon_spec=weapon_spec)
+                elif item_type == "medkit":
+                    item = GroundItem(float(spot[0]), float(spot[1]), "medkit")
+                elif item_type == "grenade":
+                    item = GroundItem(float(spot[0]), float(spot[1]), "grenade")
+                elif item_type == "ammo":
+                    item = GroundItem(float(spot[0]), float(spot[1]), "ammo")
+                else:
+                    continue
+                self.ground_items.append(item)
 
         # 毒圈初始化
         if self.stage_spec.has_poison_zone:
