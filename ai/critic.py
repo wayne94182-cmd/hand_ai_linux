@@ -35,30 +35,24 @@ class TeamPoolingCritic(nn.Module):
         )
 
     def forward(self, agent_feats, team_feats, opp_feats=None):
-        """
-        agent_feats: (B, N, 256) 或 (B, 256)
-        team_feats:  (B, N, 256) 或 (B, 256)
-        opp_feats:   (B, M, 256) 或 None（無對立隊）
-        """
-        if agent_feats.dim() == 2:
-            agent_feats = agent_feats.unsqueeze(1)
-        if team_feats.dim() == 2:
-            team_feats = team_feats.unsqueeze(1)
+        # 💡 解法：宣告新的變數 a_feats, t_feats, o_feats 來承接
+        # 絕對不要直接覆寫參數名稱 (agent_feats = ...)，避免 Python 3.12 + Dynamo 編譯崩潰
+        a_feats = agent_feats.unsqueeze(1) if agent_feats.dim() == 2 else agent_feats
+        t_feats = team_feats.unsqueeze(1) if team_feats.dim() == 2 else team_feats
             
-        B, N, H = agent_feats.shape
+        B, N, H = a_feats.shape
         
         # Team mean
-        team_mean = team_feats.mean(dim=1, keepdim=True) # (B, 1, 256)
+        team_mean = t_feats.mean(dim=1, keepdim=True) # (B, 1, 256)
         team_mean_expanded = team_mean.expand(B, N, H)   # (B, N, 256)
         
         # Opponent mean
         if opp_feats is None or opp_feats.numel() == 0:
-            opp_mean_expanded = torch.zeros(B, N, H, device=agent_feats.device, dtype=agent_feats.dtype)
+            opp_mean_expanded = torch.zeros(B, N, H, device=a_feats.device, dtype=a_feats.dtype)
         else:
-            if opp_feats.dim() == 2:
-                opp_feats = opp_feats.unsqueeze(1)
-            opp_mean = opp_feats.mean(dim=1, keepdim=True) # (B, 1, 256)
+            o_feats = opp_feats.unsqueeze(1) if opp_feats.dim() == 2 else opp_feats
+            opp_mean = o_feats.mean(dim=1, keepdim=True) # (B, 1, 256)
             opp_mean_expanded = opp_mean.expand(B, N, H)   # (B, N, 256)
         
-        combined = torch.cat([agent_feats, team_mean_expanded, opp_mean_expanded], dim=-1) # (B, N, 768)
+        combined = torch.cat([a_feats, team_mean_expanded, opp_mean_expanded], dim=-1) # (B, N, 768)
         return self.mlp(combined).squeeze(-1) # (B, N)

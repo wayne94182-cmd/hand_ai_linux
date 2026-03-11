@@ -18,6 +18,9 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import torch.optim as optim
+# 加入這行來解鎖 RTX 5070 的 TF32 矩陣加速
+torch.set_float32_matmul_precision('high')
+
 from torch.distributions import Bernoulli, Normal
 from tqdm import tqdm
 
@@ -237,13 +240,33 @@ def load_checkpoint(path, model, critic, optimizer, optimizer_critic, device):
     ckpt = torch.load(path, map_location=device)
 
     if isinstance(ckpt, dict) and "model_state" in ckpt:
+        # 1. 載入 Actor (ConvLSTM) 權重 (一定會成功)
         _unwrap(model).load_state_dict(ckpt["model_state"])
+        
         if optimizer is not None and "optimizer_state" in ckpt:
-            optimizer.load_state_dict(ckpt["optimizer_state"])
+            try:
+                optimizer.load_state_dict(ckpt["optimizer_state"])
+            except Exception as e:
+                print(f"⚠️ 忽略 Actor Optimizer 狀態: {e}")
+
+        # 2. 嘗試載入 Critic 權重
         if critic is not None and "critic_state" in ckpt:
-            _unwrap(critic).load_state_dict(ckpt["critic_state"])
-        if optimizer_critic is not None and "optimizer_critic_state" in ckpt:
-            optimizer_critic.load_state_dict(ckpt["optimizer_critic_state"])
+            try:
+                _unwrap(critic).load_state_dict(ckpt["critic_state"])
+                # 如果 Critic 載入成功，才載入它的 Optimizer
+                if optimizer_critic is not None and "optimizer_critic_state" in ckpt:
+                    optimizer_critic.load_state_dict(ckpt["optimizer_critic_state"])
+            except RuntimeError as e:
+                # 攔截維度不匹配的錯誤
+                if "size mismatch" in str(e):
+                    print("\n" + "="*60)
+                    print("⚠️ [系統提示] 偵測到 Critic 架構升級 (512 -> 768)！")
+                    print("⚠️ 已自動捨棄舊版 Critic 權重，使用全新隨機初始化。")
+                    print("⚠️ Actor (ConvLSTM) 權重已成功繼承！")
+                    print("="*60 + "\n")
+                else:
+                    raise e
+
         return (int(ckpt.get("total_eps_done", 0)),
                 int(ckpt.get("stage_id", 0)),
                 int(ckpt.get("n_ai", 1)))
