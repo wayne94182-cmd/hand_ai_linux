@@ -645,11 +645,34 @@ class GameEnv:
             view_size=VIEW_SIZE, view_center=VIEW_CENTER, tile_size=TILE_SIZE,
         )
 
-        # Ch5: 安全區（毒圈距離）
+        # Ch5: 安全區（毒圈距離場）
         if self.stage_spec.has_poison_zone and self.poison_radius < float('inf'):
-            dist_self = _math.hypot(ax - self.poison_cx, ay - self.poison_cy)
-            # 1.0=圈心安全, 0.0=剛好在圈邊, 負值=圈外危險
-            view[5] = float(np.clip(1.0 - dist_self / max(1.0, self.poison_radius), -1.0, 1.0))
+            # 為每個視野格子計算到毒圈邊界的距離
+            for row in range(VIEW_SIZE):
+                for col in range(VIEW_SIZE):
+                    # 將視野坐標轉換回世界坐標
+                    # 逆向轉換：從 (row, col) -> (dr, dc) -> (ft, rt) -> (wx, wy)
+                    dr = row - VIEW_CENTER
+                    dc = col - VIEW_CENTER
+                    # 從 45度旋轉坐標系反推 forward/right
+                    ft = (dr + dc) * 1.41421356 / 2.0
+                    rt = (dr - dc) * 1.41421356 / 2.0
+                    # 轉換到世界坐標
+                    wx = ax + (fwd_x * ft + rgt_x * rt) * cur_tile_size
+                    wy = ay + (fwd_y * ft + rgt_y * rt) * cur_tile_size
+
+                    # 計算該點到毒圈中心的距離
+                    dist_to_center = _math.hypot(wx - self.poison_cx, wy - self.poison_cy)
+                    # 計算到毒圈邊界的距離（正=安全內，負=危險外）
+                    dist_to_edge = self.poison_radius - dist_to_center
+
+                    # 標準化：
+                    # +1.0 = 圈心非常安全（距離邊界 > 200px）
+                    # 0.0 = 剛好在邊界
+                    # -1.0 = 圈外危險（距離邊界 > 200px）
+                    safety_scale = 200.0  # 梯度範圍
+                    safety_value = float(np.clip(dist_to_edge / safety_scale, -1.0, 1.0))
+                    view[5, row, col] = safety_value
         else:
             view[5] = 1.0
 
@@ -1145,6 +1168,15 @@ class GameEnv:
 
         # 子彈碰撞
         for p in self.projectiles[:]:
+            # 1. 防呆：確保子彈沒有一出生就產在牆壁內（槍管穿牆）
+            if self.is_wall(p.x, p.y):
+                if p in self.projectiles:
+                    self.projectiles.remove(p)
+                continue
+
+            # 記錄移動前的舊座標，供 CCD 軌跡檢查使用
+            old_x, old_y = p.x, p.y
+            
             hit_someone = False
             for ag in self.all_agents:
                 if ag.truly_dead() or ag is p.owner:
@@ -1180,10 +1212,14 @@ class GameEnv:
                         self.projectiles.remove(p)
                     hit_someone = True
                     break
+                    
             if hit_someone:
                 continue
+                
             p.update()
-            if self.is_wall(p.x, p.y) or p.life <= 0:
+            
+            # 2. CCD 穿牆檢查：如果舊位置到新位置之間的連線被牆壁阻擋，或新位置是牆壁
+            if not self.has_line_of_sight(old_x, old_y, p.x, p.y) or self.is_wall(p.x, p.y) or p.life <= 0:
                 if p in self.projectiles:
                     self.projectiles.remove(p)
 
