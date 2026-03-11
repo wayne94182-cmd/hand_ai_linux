@@ -255,6 +255,15 @@ def watch_ai(ckpt: str, stage_id: int,
     # 通訊向量（上一步輸出，供下一步做 comm_in）
     comm_vecs = [np.zeros(NUM_COMM, dtype=np.float32) for _ in range(n_ai)]
 
+    # 相機系統（簡單平移，不旋轉）
+    camera_x = WIDTH / 2   # 相機中心 X（世界坐標）
+    camera_y = HEIGHT / 2  # 相機中心 Y（世界坐標）
+    camera_mode = "follow"  # "follow" 或 "free"
+    follow_agent_index = 0  # 跟隨哪個 learning agent
+    camera_dragging = False
+    drag_start_pos = (0, 0)
+    drag_start_camera = (0.0, 0.0)
+
     done = False
     step = 0
     actions = [[0.0] * NUM_ACTIONS_DISCRETE for _ in range(n_ai)]
@@ -269,43 +278,94 @@ def watch_ai(ckpt: str, stage_id: int,
         s = SPEED_STEPS[speed_idx]
         return f"{s:.2g}x"
 
+    def world_to_screen(wx, wy):
+        """世界坐標 → 屏幕坐標（簡單平移，不旋轉）"""
+        sx = wx - camera_x + WIDTH / 2
+        sy = wy - camera_y + HEIGHT / 2
+        return (sx, sy)
+
+    def update_camera():
+        """更新相機位置"""
+        nonlocal camera_x, camera_y
+        if camera_mode == "follow" and env.learning_agents:
+            idx = follow_agent_index % len(env.learning_agents)
+            agent = env.learning_agents[idx]
+            if not agent.truly_dead():
+                camera_x = agent.x
+                camera_y = agent.y
+
     def draw_frame():
+        # 更新相機位置
+        update_camera()
+
         pygame.draw.rect(screen, (20, 20, 30), (0, 0, WIDTH, HEIGHT))
 
-        for r in range(ROWS):
-            for c in range(COLS):
+        # 繪製地形（使用相機偏移）
+        for r in range(env.grid_rows):
+            for c in range(env.grid_cols):
                 if env.grid[r, c] == 1:
+                    wx, wy = c * TILE_SIZE, r * TILE_SIZE
+                    sx, sy = world_to_screen(wx, wy)
                     pygame.draw.rect(screen, (100, 100, 120),
-                                     (c * TILE_SIZE, r * TILE_SIZE,
-                                      TILE_SIZE, TILE_SIZE))
+                                     (int(sx), int(sy), TILE_SIZE, TILE_SIZE))
 
-        # 地面道具
+        # 繪製毒圈（如果有）
+        if hasattr(env.stage_spec, 'has_poison_zone') and env.stage_spec.has_poison_zone:
+            if env.poison_radius < float('inf'):
+                center_screen = world_to_screen(env.poison_cx, env.poison_cy)
+                pygame.draw.circle(screen, (255, 60, 60),
+                                 (int(center_screen[0]), int(center_screen[1])),
+                                 int(env.poison_radius), 2)
+
+        # 地面道具（使用相機偏移）
         for gi in env.ground_items:
+            sx, sy = world_to_screen(gi.x, gi.y)
             if gi.item_type == "weapon":
                 color = (180, 180, 60)
             elif gi.item_type == "medkit":
                 color = (60, 220, 60)
             else:
                 color = (220, 60, 60)
-            pygame.draw.circle(screen, color, (int(gi.x), int(gi.y)), 4)
+            pygame.draw.circle(screen, color, (int(sx), int(sy)), 4)
 
-        # 手榴彈
+        # 手榴彈（使用相機偏移）
         for g in env.grenades_list:
             if not g.exploded:
-                pygame.draw.circle(screen, (255, 140, 0),
-                                   (int(g.x), int(g.y)), 4)
+                sx, sy = world_to_screen(g.x, g.y)
+                pygame.draw.circle(screen, (255, 140, 0), (int(sx), int(sy)), 4)
 
+        # 子彈（使用相機偏移）
         for p in env.projectiles:
-            p.draw(screen)
+            sx, sy = world_to_screen(p.x, p.y)
+            pygame.draw.circle(screen, (255, 220, 50), (int(sx), int(sy)), p.radius)
+
+        # Agents（使用相機偏移）
         for a in env.all_agents:
             if a.alive():
-                env._draw_agent(a)
+                sx, sy = world_to_screen(a.x, a.y)
+                # 繪製 agent 身體
+                pygame.draw.circle(screen, a.color, (int(sx), int(sy)), a.radius)
+                # 繪製方向指示
+                rad = math.radians(a.angle)
+                ex_world = a.x + math.cos(rad) * a.radius * 1.5
+                ey_world = a.y + math.sin(rad) * a.radius * 1.5
+                ex_screen, ey_screen = world_to_screen(ex_world, ey_world)
+                pygame.draw.line(screen, (255, 255, 0),
+                               (int(sx), int(sy)),
+                               (int(ex_screen), int(ey_screen)), 2)
 
-        # 多 AI 各用不同 FOV 顏色
+                # 跟隨目標高亮
+                if (camera_mode == "follow" and
+                    a in env.learning_agents and
+                    env.learning_agents.index(a) == follow_agent_index):
+                    pygame.draw.circle(screen, (255, 255, 100),
+                                     (int(sx), int(sy)), a.radius + 5, 2)
+
+        # 多 AI 各用不同 FOV 顏色（使用相機偏移）
         for i, la in enumerate(env.learning_agents):
             if la.alive():
                 color = FOV_COLORS[i % len(FOV_COLORS)]
-                _draw_fov_color(screen, la, color, env.show_fov)
+                _draw_fov_with_camera(screen, la, color, env.show_fov, world_to_screen)
 
         ai = env.ai_agent
         wp_name = ""
@@ -327,8 +387,17 @@ def watch_ai(ckpt: str, stage_id: int,
                 f"Win:{int(last_info.get('ai_win', False))}")
         screen.blit(font.render(hud3, True, (255, 220, 50)), (10, HEIGHT - 50))
 
+        # 相機模式指示
+        if camera_mode == "follow":
+            cam_text = f"Camera: FOLLOW Agent {follow_agent_index + 1}"
+            cam_color = (100, 255, 100)
+        else:
+            cam_text = f"Camera: FREE ({int(camera_x)}, {int(camera_y)})"
+            cam_color = (255, 200, 100)
+        screen.blit(font_sm.render(cam_text, True, cam_color), (10, 52))
+
         ctrl = font_sm.render(
-            "[Space] 暫停/繼續    []] 加速    [[] 減速    [Esc] 離開",
+            "[Space] 暫停/繼續    []] 加速    [[] 減速    [Tab] 相機模式    [1-9] 切換AI    [Esc] 離開",
             True, (130, 130, 130))
         screen.blit(ctrl, (10, HEIGHT - 26))
 
@@ -380,6 +449,41 @@ def watch_ai(ckpt: str, stage_id: int,
                     speed_idx = min(speed_idx + 1, len(SPEED_STEPS) - 1)
                 elif event.key == pygame.K_LEFTBRACKET:
                     speed_idx = max(speed_idx - 1, 0)
+                # 相機控制
+                elif event.key == pygame.K_TAB:
+                    camera_mode = "free" if camera_mode == "follow" else "follow"
+                elif pygame.K_1 <= event.key <= pygame.K_9:
+                    agent_idx = event.key - pygame.K_1
+                    if agent_idx < len(env.learning_agents):
+                        follow_agent_index = agent_idx
+                        camera_mode = "follow"
+                # 方向鍵移動相機（自由模式）
+                elif camera_mode == "free":
+                    move_speed = 40
+                    if event.key == pygame.K_UP:
+                        camera_y -= move_speed
+                    elif event.key == pygame.K_DOWN:
+                        camera_y += move_speed
+                    elif event.key == pygame.K_LEFT:
+                        camera_x -= move_speed
+                    elif event.key == pygame.K_RIGHT:
+                        camera_x += move_speed
+            # 鼠標拖動
+            elif event.type == pygame.MOUSEBUTTONDOWN:
+                if event.button == 1:  # 左鍵
+                    camera_dragging = True
+                    drag_start_pos = event.pos
+                    drag_start_camera = (camera_x, camera_y)
+                    camera_mode = "free"
+            elif event.type == pygame.MOUSEBUTTONUP:
+                if event.button == 1:
+                    camera_dragging = False
+            elif event.type == pygame.MOUSEMOTION:
+                if camera_dragging:
+                    dx = event.pos[0] - drag_start_pos[0]
+                    dy = event.pos[1] - drag_start_pos[1]
+                    camera_x = drag_start_camera[0] - dx
+                    camera_y = drag_start_camera[1] - dy
 
         now = time.perf_counter()
         dt = now - last_tick
@@ -485,8 +589,8 @@ def watch_ai(ckpt: str, stage_id: int,
             return
 
 
-def _draw_fov_color(screen, agent, color, show_fov):
-    """繪製指定顏色的 FOV 扇形"""
+def _draw_fov_with_camera(screen, agent, color, show_fov, world_to_screen):
+    """繪製指定顏色的 FOV 扇形（使用相機偏移）"""
     if not show_fov:
         return
     rad = math.radians(agent.angle)
@@ -503,7 +607,9 @@ def _draw_fov_color(screen, agent, color, show_fov):
         fov_degrees_val = float(SNIPER_FOV_DEGREES)
         tile_size_val = float(SNIPER_TILE_SIZE)
 
-    pts = [(agent.x, agent.y)]
+    # 轉換所有點到屏幕坐標
+    center_screen = world_to_screen(agent.x, agent.y)
+    pts = [center_screen]
     steps = 60
     for i in range(steps + 1):
         deg_rel = -half_fov_val + (fov_degrees_val * i / steps)
@@ -514,8 +620,9 @@ def _draw_fov_color(screen, agent, color, show_fov):
         rt_val = view_r * sin_rel
         wx = agent.x + (fwd_x * ft_val + rgt_x * rt_val) * tile_size_val
         wy = agent.y + (fwd_y * ft_val + rgt_y * rt_val) * tile_size_val
-        pts.append((wx, wy))
-    pts.append((agent.x, agent.y))
+        screen_pos = world_to_screen(wx, wy)
+        pts.append(screen_pos)
+    pts.append(center_screen)
     if len(pts) > 2:
         pygame.draw.lines(screen, color, True, pts, 1)
 
