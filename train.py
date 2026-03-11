@@ -735,6 +735,7 @@ def train(resume_path=None, forced_stage=None, target_stage_eps=50000, n_ai=2, u
         bat_comm_mu = torch.as_tensor(buf_comm_mu, dtype=torch.float32)
         bat_comm_logstd = torch.as_tensor(buf_comm_logstd, dtype=torch.float32)
         bat_masks = torch.as_tensor(buf_masks, dtype=torch.bool)
+        bat_dones = torch.as_tensor(buf_dones, dtype=torch.bool)
 
         # pin_memory + non_blocking 加速 CPU→GPU 傳輸
         if device.type == "cuda":
@@ -748,6 +749,7 @@ def train(resume_path=None, forced_stage=None, target_stage_eps=50000, n_ai=2, u
             bat_comm_mu     = bat_comm_mu.pin_memory()
             bat_comm_logstd = bat_comm_logstd.pin_memory()
             bat_masks       = bat_masks.pin_memory()
+            bat_dones       = bat_dones.pin_memory()
 
         bat_scalars     = bat_scalars.to(device, non_blocking=True)
         bat_actions     = bat_actions.to(device, non_blocking=True)
@@ -759,6 +761,7 @@ def train(resume_path=None, forced_stage=None, target_stage_eps=50000, n_ai=2, u
         bat_comm_mu     = bat_comm_mu.to(device, non_blocking=True)
         bat_comm_logstd = bat_comm_logstd.to(device, non_blocking=True)
         bat_masks       = bat_masks.to(device, non_blocking=True)
+        bat_dones       = bat_dones.to(device, non_blocking=True)
 
         # Fix 7: 預計算每個 flat index 的 team_id（用最後一次觀測到的 team）
         # 修正：相容 Tuple（CPU）與 Dict（GPU）兩種資料結構
@@ -780,6 +783,11 @@ def train(resume_path=None, forced_stage=None, target_stage_eps=50000, n_ai=2, u
         model.train()
         critic.train()
 
+        # bat_dones 是從 buf_dones 轉換來的 Tensor，形狀 (ROLLOUT_STEPS, FLAT_BATCH)
+        reset_flags = torch.zeros_like(bat_dones)
+        # t 步的 done 會導致 t+1 步重置
+        reset_flags[1:] = bat_dones[:-1]
+
         for _ in range(PPO_EPOCHS):
             optimizer.zero_grad()
             optimizer_critic.zero_grad()
@@ -792,7 +800,8 @@ def train(resume_path=None, forced_stage=None, target_stage_eps=50000, n_ai=2, u
                 logits_all, mu_all, logstd_all, feat_all, _ = model(
                     bat_states, bat_scalars, (h_tr, c_tr),
                     comm_in=None,
-                    seq_mode=True
+                    seq_mode=True,
+                    dones=reset_flags
                 )
             # logits_all: (ROLLOUT_STEPS, FLAT_BATCH, NUM_ACTIONS_DISCRETE)
             # feat_all:   (ROLLOUT_STEPS, FLAT_BATCH, HIDDEN_SIZE)

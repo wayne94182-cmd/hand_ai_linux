@@ -142,6 +142,7 @@ class ConvLSTM(nn.Module):
           scalars: (T, B, num_scalars)
           comm_in: (T, B, K, num_comm) 或 None
           hidden:  (h, c) 各 (1, B, hidden_size) 或 None
+          dones:   (T, B) Boolean Tensor for resetting hidden state 或 None
           回傳:
             logits:      (T, B, 16)
             comm_mu:     (T, B, 4)
@@ -150,7 +151,7 @@ class ConvLSTM(nn.Module):
             new_hidden:  (h, c) 各 (1, B, 256)
         """
         if seq_mode:
-            return self._forward_seq(x, scalars, hidden, comm_in)
+            return self._forward_seq(x, scalars, hidden, comm_in, dones)
         else:
             return self._forward_single(x, scalars, hidden, comm_in)
 
@@ -199,7 +200,7 @@ class ConvLSTM(nn.Module):
         return logits, comm_mu, comm_logstd, feat, new_hidden
 
     @torch.compiler.disable
-    def _forward_seq(self, x, scalars, hidden, comm_in):
+    def _forward_seq(self, x, scalars, hidden, comm_in, dones=None):
         """整條時間序列 forward，CNN 平行分塊，LSTM 原生批次處理（cuDNN 加速）。
 
         Task 2 修復：移除 for t in range(T) 迴圈，改用 LSTM 原生時序處理，
@@ -249,9 +250,22 @@ class ConvLSTM(nn.Module):
                 self.fc_fuse(torch.cat([embed_seq, ctx_zero], dim=-1))
             ))  # (T, B, 256)
 
-            # LSTM 原生時序處理（batch_first=False → 輸入 (T, B, H)）
-            # ⚡ cuDNN 平行運算 512 個時間步，單一 kernel launch！
-            lstm_out, (h_t, c_t) = self.lstm(fused, hidden)  # (T, B, 256)
+            h_t, c_t = hidden
+            lstm_out_list = []
+            
+            for t in range(T):
+                if dones is not None:
+                    # dones[t] 為 True 代表該環境此時是新開局，需清除記憶
+                    # mask 形狀需調整為 (1, B, 1) 以便與 (1, B, HIDDEN_SIZE) 廣播相乘
+                    mask = (~dones[t]).float().unsqueeze(0).unsqueeze(-1)
+                    h_t = h_t * mask
+                    c_t = c_t * mask
+                
+                curr_fused = fused[t].unsqueeze(0)  # (1, B, 256)
+                out_t, (h_t, c_t) = self.lstm(curr_fused, (h_t, c_t))
+                lstm_out_list.append(out_t.squeeze(0))
+                
+            lstm_out = torch.stack(lstm_out_list, dim=0)  # (T, B, 256)
 
         # 3. LayerNorm + 輸出頭（可再次平行運算）
         feat = self.lstm_norm(lstm_out)                            # (T, B, 256)
