@@ -123,7 +123,7 @@ class ConvLSTM(nn.Module):
         ctx = self.attn_out(ctx)
         return ctx
 
-    def forward(self, x, scalars, hidden=None, comm_in=None, seq_mode=False):
+    def forward(self, x, scalars, hidden=None, comm_in=None, seq_mode=False, dones=None):
         """
         seq_mode=False（預設，供 rollout 使用）:
           x:       (B, C, H, W)

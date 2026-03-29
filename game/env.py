@@ -272,33 +272,165 @@ class GameEnv:
 
         n_la = self.n_learning_agents
         n_total = n_la + self.stage_spec.teammate_count + self.stage_spec.enemy_count
-        spawns = []
+
+        # ═════════════════════════════════════════════════════════════
+        # 新版出生點邏輯：同隊集群出生，不同隊盡量分散
+        # ═════════════════════════════════════════════════════════════
+
+        # 先確定各 learning agent 的 team_id
+        learning_team_ids = []
+        for i in range(n_la):
+            if self.stage_id in (4, 5):
+                # Stage 4-5: 3v3 自我博弈，前 3 個是 team 0
+                # （後 3 個來自 enemy_agents，也會是 team 1）
+                tid = 0
+            elif self.stage_id == 6:
+                # Stage 6: 可能是 2v2v2 或其他配置，前 2 個是 team 0，其他是 team 1
+                tid = 0 if i < 2 else 1
+            else:
+                # Stage 0-3: 所有 learning agents 都是 team 0
+                tid = 0
+            learning_team_ids.append(tid)
+
+        # 計算每隊的人數（learning agents + teammates）
+        team0_count = learning_team_ids.count(0) + self.stage_spec.teammate_count
+        team1_count = learning_team_ids.count(1)
+        enemy_count = self.stage_spec.enemy_count
+
         random.shuffle(empty_spots)
-        for _ in range(n_total):
-            best_spot = empty_spots[0]
+        spawns = []
+
+        # 生成團隊出生點的輔助函數
+        def generate_team_spawns(team_size, cluster_radius=120.0):
+            """為一個團隊生成集群出生點"""
+            if team_size == 0:
+                return []
+
+            # 選擇團隊中心點：與已有出生點盡量遠離
             if spawns:
-                candidates = empty_spots[:20]
+                candidates = empty_spots[:30]
                 max_min_dist = -1
+                team_center = empty_spots[0]
                 for cand in candidates:
                     min_dist = min(math.hypot(cand[0] - s[0], cand[1] - s[1]) for s in spawns)
                     if min_dist > max_min_dist:
                         max_min_dist = min_dist
-                        best_spot = cand
-            spawns.append(best_spot)
-            empty_spots.remove(best_spot)
+                        team_center = cand
+            else:
+                team_center = empty_spots[0]
 
+            team_spawns = [team_center]
+            empty_spots.remove(team_center)
+
+            # 為團隊其他成員選擇中心點附近的位置
+            for _ in range(team_size - 1):
+                # 在中心點附近尋找出生點
+                nearby = [
+                    spot for spot in empty_spots
+                    if math.hypot(spot[0] - team_center[0], spot[1] - team_center[1]) <= cluster_radius
+                ]
+
+                if nearby:
+                    # 在附近位置中選擇與隊友距離適中的點（不要重疊但也不要太遠）
+                    best_spot = nearby[0]
+                    best_score = -1
+                    for spot in nearby[:15]:  # 只檢查前 15 個附近位置
+                        # 計算到隊友的平均距離
+                        avg_dist = sum(
+                            math.hypot(spot[0] - s[0], spot[1] - s[1])
+                            for s in team_spawns
+                        ) / len(team_spawns)
+                        # 理想距離是 60-100 像素（1.5-2.5 個 tile）
+                        score = -abs(avg_dist - 80.0)
+                        if score > best_score:
+                            best_score = score
+                            best_spot = spot
+                    team_spawns.append(best_spot)
+                    empty_spots.remove(best_spot)
+                else:
+                    # 如果附近沒有空位，選擇最近的可用位置
+                    if empty_spots:
+                        best_spot = min(
+                            empty_spots,
+                            key=lambda s: math.hypot(s[0] - team_center[0], s[1] - team_center[1])
+                        )
+                        team_spawns.append(best_spot)
+                        empty_spots.remove(best_spot)
+
+            return team_spawns
+
+        # ═════════════════════════════════════════════════════════════
+        # 按階段生成出生點
+        # ═════════════════════════════════════════════════════════════
+        if self.stage_id in (4, 5):
+            # Stage 4-5: 自我博弈，所有隊伍集群出生
+            if self.stage_id == 4:
+                # Stage 4: 3v3 (team 0 vs team 1)
+                if team0_count > 0:
+                    team0_spawns = generate_team_spawns(team0_count, cluster_radius=120.0)
+                    spawns.extend(team0_spawns)
+                # team 1 來自 enemy_agents (3 個)，直接用 enemy_count
+                if enemy_count > 0:
+                    team1_spawns = generate_team_spawns(enemy_count, cluster_radius=120.0)
+                    spawns.extend(team1_spawns)
+            else:
+                # Stage 5: 3 人 3 隊 (team 0, 1, 2)
+                # team 0: 前 3 個 learning_agents
+                if team0_count > 0:
+                    team0_spawns = generate_team_spawns(team0_count, cluster_radius=120.0)
+                    spawns.extend(team0_spawns)
+                # team 1: enemy[0,1,2]
+                team1_spawns = generate_team_spawns(3, cluster_radius=120.0)
+                spawns.extend(team1_spawns)
+                # team 2: enemy[3,4,5]
+                team2_spawns = generate_team_spawns(3, cluster_radius=120.0)
+                spawns.extend(team2_spawns)
+        elif self.stage_id >= 6:
+            # Stage 6: 可能有 self_play，集群出生
+            if team0_count > 0:
+                team0_spawns = generate_team_spawns(team0_count, cluster_radius=120.0)
+                spawns.extend(team0_spawns)
+            if team1_count > 0:
+                team1_spawns = generate_team_spawns(team1_count, cluster_radius=120.0)
+                spawns.extend(team1_spawns)
+            # 敵人集群出生
+            if enemy_count > 0:
+                enemy_spawns = generate_team_spawns(enemy_count, cluster_radius=120.0)
+                spawns.extend(enemy_spawns)
+        else:
+            # Stage 0-3: scripted NPC，分散出生
+            # Team 0 集群出生
+            if team0_count > 0:
+                team0_spawns = generate_team_spawns(team0_count, cluster_radius=120.0)
+                spawns.extend(team0_spawns)
+            if team1_count > 0:
+                team1_spawns = generate_team_spawns(team1_count, cluster_radius=120.0)
+                spawns.extend(team1_spawns)
+            # 敵人分散出生
+            for _ in range(enemy_count):
+                if spawns:
+                    candidates = empty_spots[:20]
+                    max_min_dist = -1
+                    best_spot = empty_spots[0]
+                    for cand in candidates:
+                        min_dist = min(math.hypot(cand[0] - s[0], cand[1] - s[1]) for s in spawns)
+                        if min_dist > max_min_dist:
+                            max_min_dist = min_dist
+                            best_spot = cand
+                    spawns.append(best_spot)
+                    empty_spots.remove(best_spot)
+                else:
+                    spawns.append(empty_spots.pop(0))
+
+        # ═════════════════════════════════════════════════════════════
+        # 按照原順序分配出生點：learning agents → teammates → enemies
+        # ═════════════════════════════════════════════════════════════
         idx = 0
 
         # Learning agents
         self.learning_agents = []
         for i in range(n_la):
-            # team_id 由 stage 決定
-            if self.stage_id == 5:
-                tid = 0 if i == 0 else 1
-            elif self.stage_id == 6:
-                tid = 0 if i < 2 else 1
-            else:
-                tid = 0
+            tid = learning_team_ids[i]
             color = (0, 140, 255) if tid == 0 else (255, 80, 80)
             team_str = "ai" if i == 0 else f"ai_{i}"
             a = Agent(spawns[idx][0], spawns[idx][1], color, team_str, bot_type="learning")
@@ -340,7 +472,7 @@ class GameEnv:
             if self.stage_id == 3:
                 bot_type = "turret_walk"
             elif self.stage_id == 4:
-                bot_type = "assault"
+                bot_type = "self_play"  # Stage 4 改為 3v3 自我博弈
             elif self.stage_id == 5:
                 bot_type = "self_play"
             elif self.stage_id == 6 and i == 1:
@@ -348,17 +480,30 @@ class GameEnv:
             elif self.stage_id == 6:
                 bot_type = "assault"
 
+            # 決定 team_id：Stage 5 是 3 人 3 隊，其他是 team 1
+            if self.stage_id == 5:
+                # Stage 5: 3 人 3 隊（team 0, 1, 2）
+                # enemy[0,1,2] → team 1
+                # enemy[3,4,5] → team 2
+                enemy_team_id = 1 if i < 3 else 2
+            else:
+                enemy_team_id = 1
+
             e = Agent(
                 spawns[idx][0], spawns[idx][1],
                 (255, 80, 80), f"enemy_{i}",
                 bot_type=bot_type,
                 infinite_ammo=(bot_type != "self_play"),
             )
-            e.team_id = 1
+            e.team_id = enemy_team_id
             e.max_hp = self.stage_spec.enemy_hp
             e.hp = self.stage_spec.enemy_hp
             idx += 1
             self.enemy_agents.append(e)
+
+            # ★ 關鍵：如果是 self_play，也加入 learning_agents
+            if bot_type == "self_play":
+                self.learning_agents.append(e)
 
         self.all_agents = self.learning_agents + self.team_agents + self.enemy_agents
         self.projectiles = []
@@ -433,7 +578,7 @@ class GameEnv:
 
         # 回傳 states
         states = [self._get_local_view(a) for a in self.learning_agents]
-        if self.n_learning_agents == 1:
+        if len(self.learning_agents) == 1:
             return states[0]
         return states
 
@@ -1295,6 +1440,20 @@ class GameEnv:
                 if not agent.truly_dead() and not agent.is_downed():
                     rewards[i] += survival_bonus
 
+        # 裝備缺失懲罰：分開扣分，建立「撿到一個算一個」的進步梯度
+        for i, agent in enumerate(self.learning_agents):
+            if agent.truly_dead() or agent.is_downed():
+                continue
+            
+            # 1. 沒槍的懲罰
+            if len(agent.weapon_slots) == 0:
+                rewards[i] -= (GameConfig.EQUIPMENT_MISSED_PENALTY / 60.0)
+                
+            # 2. 沒備用彈匣的懲罰
+            if agent.ammo_boxes <= 0:
+                # 注意：可以考慮給彈匣稍微輕一點的懲罰，或是用一樣的常數
+                rewards[i] -= (GameConfig.EQUIPMENT_MISSED_PENALTY / 60.0)
+
         # 存活懲罰：以「尚未倒地」的敵方 NPC 數量為基準
         standing_enemies_cnt = sum(1 for e in self.enemy_agents if not e.truly_dead() and not e.is_downed())
         for i, agent in enumerate(self.learning_agents):
@@ -1330,16 +1489,22 @@ class GameEnv:
         done = False
         ai_win = False
         ai_lost = False
-
-        # 全員 truly_dead 才算役出（倒地中不算）
-        any_la_alive = any(not a.truly_dead() for a in self.learning_agents)
-        alive_enemy_cnt = len(self._alive_enemies())
-        enemies_alive = alive_enemy_cnt > 0
-        allies_alive = len(self._alive_allies()) > 0
-
         team_reward = 0.0
 
-        if self.stage_id in (0, 1, 2, 3, 4):
+        # 計算各隊伍的存活狀況
+        teams_alive = {}
+        for agent in self.learning_agents:
+            if agent.team_id not in teams_alive:
+                teams_alive[agent.team_id] = []
+            if not agent.truly_dead():
+                teams_alive[agent.team_id].append(agent)
+
+        # Stage 0-3: 傳統的 AI vs NPC
+        if self.stage_id in (0, 1, 2, 3):
+            any_la_alive = any(not a.truly_dead() for a in self.learning_agents)
+            alive_enemy_cnt = len(self._alive_enemies())
+            enemies_alive = alive_enemy_cnt > 0
+
             time_out = self.frame_count >= self.stage_spec.max_frames
             if not any_la_alive or not enemies_alive or time_out:
                 done = True
@@ -1354,27 +1519,54 @@ class GameEnv:
                 else:
                     team_reward -= GameConfig.TIE_PENALTY
 
-        elif self.stage_id == 5:
-            if not any_la_alive or not enemies_alive or self.frame_count >= self.stage_spec.max_frames:
+        # Stage 4: 3v3 自我博弈
+        elif self.stage_id == 4:
+            team0_alive = len(teams_alive.get(0, []))
+            team1_alive = len(teams_alive.get(1, []))
+            time_out = self.frame_count >= self.stage_spec.max_frames
+
+            if team0_alive == 0 or team1_alive == 0 or time_out:
                 done = True
-                if any_la_alive and not enemies_alive:
-                    ai_win = True
+                if team0_alive > 0 and team1_alive == 0:
+                    ai_win = True  # Team 0 勝利
                     team_reward += GameConfig.WIN_REWARD
-                elif (not any_la_alive) and enemies_alive:
-                    ai_lost = True
+                elif team0_alive == 0 and team1_alive > 0:
+                    ai_lost = True  # Team 1 勝利（對 team 0 來說是失敗）
                     team_reward -= GameConfig.LOSE_PENALTY
                 else:
                     team_reward -= GameConfig.TIE_PENALTY
 
-        elif self.stage_id == 6:
-            enemies_team_dead = not enemies_alive
-            allies_team_dead = not allies_alive
-            if enemies_team_dead or allies_team_dead or self.frame_count >= self.stage_spec.max_frames:
+        # Stage 5: 3 人 3 隊（最後一隊存活算勝利）
+        elif self.stage_id == 5:
+            alive_teams = [tid for tid, agents in teams_alive.items() if len(agents) > 0]
+            time_out = self.frame_count >= self.stage_spec.max_frames
+
+            if len(alive_teams) <= 1 or time_out:
                 done = True
-                if enemies_team_dead and not allies_team_dead:
+                if len(alive_teams) == 1:
+                    winner_team = alive_teams[0]
+                    if winner_team == 0:
+                        ai_win = True  # Team 0 勝利
+                        team_reward += GameConfig.WIN_REWARD
+                    else:
+                        ai_lost = True  # 其他隊勝利
+                        team_reward -= GameConfig.LOSE_PENALTY
+                else:
+                    team_reward -= GameConfig.TIE_PENALTY
+
+        # Stage 6: 傳統對抗 + 名人堂
+        elif self.stage_id == 6:
+            allies_alive = len(self._alive_allies()) > 0
+            alive_enemy_cnt = len(self._alive_enemies())
+            enemies_alive = alive_enemy_cnt > 0
+            time_out = self.frame_count >= self.stage_spec.max_frames
+
+            if not allies_alive or not enemies_alive or time_out:
+                done = True
+                if allies_alive and not enemies_alive:
                     ai_win = True
                     team_reward += GameConfig.WIN_REWARD
-                elif allies_team_dead and not enemies_team_dead:
+                elif (not allies_alive) and enemies_alive:
                     ai_lost = True
                     team_reward -= GameConfig.LOSE_PENALTY
                 else:
@@ -1384,7 +1576,11 @@ class GameEnv:
         final_rewards = [GameConfig.INDIVIDUAL_REWARD_WEIGHT * rewards[i] + GameConfig.TEAM_REWARD_WEIGHT * team_reward
                          for i in range(len(self.learning_agents))]
 
+        # 為 info 字典計算通用的統計資訊
+        any_la_alive = any(not a.truly_dead() for a in self.learning_agents)
+        alive_enemy_cnt = len(self._alive_enemies())
         downed_or_dead_cnt = sum(1 for e in self.enemy_agents if e.is_downed() or e.truly_dead())
+
         info = {
             "stage_id": self.stage_id,
             "stage_name": self.stage_spec.name,
@@ -1422,8 +1618,8 @@ class GameEnv:
             for i in range(len(total_rewards)):
                 total_rewards[i] += rews[i]
 
-        # 向後相容：n_learning_agents==1 時維持原格式
-        if self.n_learning_agents == 1:
+        # 向後相容：實際只有 1 個 learning agent 時維持原格式
+        if len(self.learning_agents) == 1:
             return states[0], total_rewards[0], done, info
         return states, total_rewards, done, info
 

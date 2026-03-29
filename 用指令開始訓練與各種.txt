@@ -3,3 +3,4 @@ source venv/bin/activate
 2.	觀戰（指定存檔+階段）: python watch.py --ckpt snn_S0_ep_70000.pth --stage 5 --ai_view
 3.  試玩：python play.py --stage 0 --n_ai 1 --max_frames 1200 --weapon sniper
 pkill -f train.py
+

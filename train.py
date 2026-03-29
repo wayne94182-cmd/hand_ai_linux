@@ -51,7 +51,7 @@ logger = logging.getLogger(__name__)
 
 # ── 超參數 ──────────────────────────────────────────────
 FRAME_SKIP = 2
-NUM_ENVS = 96
+NUM_ENVS = 128
 ROLLOUT_STEPS = 512  # 固定步數採樣（Fixed-Length Rollout）
 GAMMA = 0.990
 GAE_LAMBDA = 0.95
@@ -589,21 +589,32 @@ def train(resume_path=None, forced_stage=None, target_stage_eps=50000, n_ai=2, u
                 # Fix 3: 分 team 呼叫 Critic
                 feat_env = feat.detach().view(n_ai, NUM_ENVS, HIDDEN_SIZE).transpose(0, 1) # (NUM_ENVS, n_ai, HIDDEN_SIZE)
                 team_ids_t = torch.as_tensor(team_ids, dtype=torch.int32, device=device) # (NUM_ENVS, n_ai)
-                t0_mask = team_ids_t == 0
-                t1_mask = team_ids_t == 1
-                
-                N0 = t0_mask[0].sum().item()
-                N1 = t1_mask[0].sum().item()
-                
+
                 v_env_r = torch.zeros(NUM_ENVS, n_ai, device=device)
-                
-                t0_f = feat_env[t0_mask].view(NUM_ENVS, N0, HIDDEN_SIZE) if N0 > 0 else None
-                t1_f = feat_env[t1_mask].view(NUM_ENVS, N1, HIDDEN_SIZE) if N1 > 0 else None
-                
-                if N0 > 0:
-                    v_env_r[t0_mask] = critic(t0_f, t0_f, t1_f).flatten()
-                if N1 > 0:
-                    v_env_r[t1_mask] = critic(t1_f, t1_f, t0_f).flatten()
+
+                # 支持多隊：為每個隊伍計算 value
+                unique_teams = torch.unique(team_ids_t[0])
+                for team_id in unique_teams:
+                    team_mask = team_ids_t == team_id.item()
+                    N_team = team_mask[0].sum().item()
+
+                    if N_team == 0:
+                        continue
+
+                    # 隊友特徵
+                    team_f = feat_env[team_mask].view(NUM_ENVS, N_team, HIDDEN_SIZE)
+
+                    # 對手特徵：所有非同隊的 agents
+                    opp_mask = team_ids_t != team_id.item()
+                    N_opp = opp_mask[0].sum().item()
+
+                    if N_opp > 0:
+                        opp_f = feat_env[opp_mask].view(NUM_ENVS, N_opp, HIDDEN_SIZE)
+                    else:
+                        opp_f = None
+
+                    # 計算 value
+                    v_env_r[team_mask] = critic(team_f, team_f, opp_f).flatten()
                     
                 v = v_env_r.transpose(0, 1).reshape(FLAT_BATCH)
 
@@ -880,26 +891,36 @@ def train(resume_path=None, forced_stage=None, target_stage_eps=50000, n_ai=2, u
             # feat_all 的形狀為 (ROLLOUT_STEPS, FLAT_BATCH, HIDDEN_SIZE)
             # FLAT_BATCH = n_ai * NUM_ENVS
             feat_env = feat_all.view(ROLLOUT_STEPS, n_ai, NUM_ENVS, HIDDEN_SIZE).transpose(1, 2).reshape(ROLLOUT_STEPS * NUM_ENVS, n_ai, HIDDEN_SIZE)
-            
+
             # 使用準確收集的 buf_team_ids 構建 Mask
             team_ids_all = torch.as_tensor(buf_team_ids, dtype=torch.int32, device=device)
             team_ids_env = team_ids_all.view(ROLLOUT_STEPS, n_ai, NUM_ENVS).transpose(1, 2).reshape(ROLLOUT_STEPS * NUM_ENVS, n_ai)
-            
-            t0_mask_all = team_ids_env == 0
-            t1_mask_all = team_ids_env == 1
-            
+
             v_pred_env = torch.zeros(ROLLOUT_STEPS * NUM_ENVS, n_ai, device=device)
-            
-            N0 = t0_mask_all[0].sum().item()
-            N1 = t1_mask_all[0].sum().item()
-            
-            t0_feat = feat_env[t0_mask_all].view(ROLLOUT_STEPS * NUM_ENVS, N0, HIDDEN_SIZE) if N0 > 0 else None
-            t1_feat = feat_env[t1_mask_all].view(ROLLOUT_STEPS * NUM_ENVS, N1, HIDDEN_SIZE) if N1 > 0 else None
-            
-            if N0 > 0:
-                v_pred_env[t0_mask_all] = critic(t0_feat, t0_feat, t1_feat).flatten()
-            if N1 > 0:
-                v_pred_env[t1_mask_all] = critic(t1_feat, t1_feat, t0_feat).flatten()
+
+            # 支持多隊：為每個隊伍計算 value
+            unique_teams = torch.unique(team_ids_env[0])
+            for team_id in unique_teams:
+                team_mask = team_ids_env == team_id.item()
+                N_team = team_mask[0].sum().item()
+
+                if N_team == 0:
+                    continue
+
+                # 隊友特徵
+                team_feat = feat_env[team_mask].view(ROLLOUT_STEPS * NUM_ENVS, N_team, HIDDEN_SIZE)
+
+                # 對手特徵：所有非同隊的 agents
+                opp_mask = team_ids_env != team_id.item()
+                N_opp = opp_mask[0].sum().item()
+
+                if N_opp > 0:
+                    opp_feat = feat_env[opp_mask].view(ROLLOUT_STEPS * NUM_ENVS, N_opp, HIDDEN_SIZE)
+                else:
+                    opp_feat = None
+
+                # 計算 value
+                v_pred_env[team_mask] = critic(team_feat, team_feat, opp_feat).flatten()
             
             # 將 v_pred_env 變換回 (TB,)
             # (ROLLOUT_STEPS * NUM_ENVS, n_ai) -> (ROLLOUT_STEPS, NUM_ENVS, n_ai) -> reshape(TB)

@@ -20,6 +20,7 @@ class GameConfig:
     SHOOT_PENALTY = 0.04
     RADAR_REWARD = 0.005
     SURVIVAL_COST = 0.01
+    EQUIPMENT_MISSED_PENALTY = 0.6
     NPC_SURVIVAL_COST = 0.003
     DASH_COST_HP = 5
     DASH_PENALTY = -0.2
@@ -151,34 +152,34 @@ STAGE_SPECS = {
         n_learning_agents=2,
     ),
 
-    # Stage 4：戰術期｜三人、大地圖、毒圈、強NPC
+    # Stage 4：戰術期｜3v3 自我博弈、大地圖、毒圈
     4: StageSpec(
-        stage_id=4, name="戰術期", mode="scripted",
-        enemy_hp=150, enemy_damage=20, bullet_damage=20,
-        enemy_fire_rate=4.0, enemy_spread_deg=20.0,
+        stage_id=4, name="戰術期 3v3", mode="self_play",
+        enemy_hp=100, enemy_damage=20, bullet_damage=20,
+        enemy_fire_rate=0.0, enemy_spread_deg=0.0,
         enemy_can_shoot=True, enemy_mobile=True,
-        teammate_count=0, enemy_count=4,
+        teammate_count=0, enemy_count=3,  # 3 個敵對 AI（實際上是 self_play）
         max_frames=5400,
         move_noise_pct=0.10, rotation_noise_pct=0.10,
         infinite_ammo=False,
         body_speed_range=(0.85, 1.15), body_rot_range=(0.85, 1.15),
         has_poison_zone=True, map_pool_key="large+medium",
-        n_learning_agents=3,
+        n_learning_agents=3,  # 總共 6 個 learning agents (3v3)
     ),
 
-    # Stage 5：自我博弈｜三人兩隊、大地圖、毒圈
+    # Stage 5：自我博弈｜3 人 3 隊、大地圖、毒圈（總共 9 個 AI）
     5: StageSpec(
-        stage_id=5, name="自我博弈", mode="self_play",
+        stage_id=5, name="自我博弈 3 隊", mode="self_play",
         enemy_hp=100, enemy_damage=20, bullet_damage=20,
         enemy_fire_rate=0.0, enemy_spread_deg=0.0,
         enemy_can_shoot=True, enemy_mobile=True,
-        teammate_count=0, enemy_count=3,
+        teammate_count=0, enemy_count=6,  # 6 個敵對 AI（3+3）
         max_frames=5400,
         move_noise_pct=0.12, rotation_noise_pct=0.12,
         infinite_ammo=False,
         body_speed_range=(0.80, 1.25), body_rot_range=(0.80, 1.25),
         has_poison_zone=True, map_pool_key="large",
-        n_learning_agents=3,
+        n_learning_agents=3,  # 總共 9 個 learning agents (3+3+3)
     ),
 
     # Stage 6：多隊博弈｜三人、30%名人堂舊AI參戰、大地圖、毒圈

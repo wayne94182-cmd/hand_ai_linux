@@ -200,7 +200,7 @@ def _unpack_state(state_tuple):
 
 
 def watch_ai(ckpt: str, stage_id: int,
-             max_frames: int | None = None,
+             max_frames: int = 1200,
              show_ai_view: bool = False,
              show_comm: bool = False):
 
@@ -213,22 +213,8 @@ def watch_ai(ckpt: str, stage_id: int,
     model, n_ai = load_model(model_path, device)
     stage_spec = get_stage_spec(stage_id)
 
-    # 使用階段配置的 n_learning_agents 而非 checkpoint 中的 n_ai
-    # 這樣可以正確載入該階段的設定（如敵人數量、毒圈等）
-    actual_n_ai = stage_spec.n_learning_agents
-
-    # 如果模型的 agent 數量與階段不符，發出警告
-    if n_ai != actual_n_ai:
-        print(f"警告: checkpoint 的 n_ai={n_ai}，但 Stage {stage_id} 需要 {actual_n_ai} 個 agent")
-        print(f"      將使用階段配置的 {actual_n_ai} 個 agent")
-
-    # 使用階段配置的 max_frames，除非用戶明確指定
-    if max_frames is None:
-        max_frames = stage_spec.max_frames
-
-    print(f"載入模型  : {model_path} (checkpoint n_ai={n_ai}, 使用 n_ai={actual_n_ai})")
+    print(f"載入模型  : {model_path} (n_ai={n_ai})")
     print(f"觀戰階段  : Stage {stage_id} - {stage_spec.name}")
-    print(f"最大幀數  : {max_frames}")
     print("操作說明  : [Space] 暫停  []] 加速  [[] 減速  [Esc] 離開")
 
     ch_px = 15 * CELL
@@ -247,28 +233,17 @@ def watch_ai(ckpt: str, stage_id: int,
     font_big = fonts["big"]
 
     env = GameEnv(render_mode=False, stage_id=stage_id, show_fov=True,
-                  n_learning_agents=actual_n_ai)
+                  n_learning_agents=n_ai)
     env.screen = screen
     env.font = font
     env.stage_spec = replace(env.stage_spec, max_frames=max_frames)
 
     # ── Reset 並解包 state ──
     result = env.reset()
-
-    # 使用實際的 learning agents 數量（可能因為 self_play 而增加）
-    # Stage 4: 3 + 3 (enemy self_play) = 6
-    # Stage 5: 3 + 6 (enemy self_play) = 9
-    actual_learning_count = len(env.learning_agents)
-
-    if actual_learning_count == 1:
+    if n_ai == 1:
         states = [result]          # result = (view, scalars, team_id)
     else:
         states = result            # result = [(view, scalars, tid), ...]
-
-    n_ai = actual_learning_count
-
-    print(f"實際 learning agents 數量: {n_ai}")
-    print(f"Team IDs: {[a.team_id for a in env.learning_agents]}")
 
     # ── LSTM hidden per agent: (h, c) 各 (1, 1, HIDDEN_SIZE) ──
     hiddens = [
@@ -294,8 +269,7 @@ def watch_ai(ckpt: str, stage_id: int,
     actions = [[0.0] * NUM_ACTIONS_DISCRETE for _ in range(n_ai)]
     paused = False
     speed_idx = DEFAULT_SPEED_IDX
-    # 初始化時使用 follow_agent_index 的視野
-    v0, s0, _ = _unpack_state(states[follow_agent_index])
+    v0, s0, _ = _unpack_state(states[0])
     last_view_np = v0.copy()
     last_reward = 0.0
     last_info: dict = {}
@@ -483,10 +457,6 @@ def watch_ai(ckpt: str, stage_id: int,
                     if agent_idx < len(env.learning_agents):
                         follow_agent_index = agent_idx
                         camera_mode = "follow"
-                        # 立即更新 AI view 為新選擇的 agent
-                        if agent_idx < len(states):
-                            v_new, _, _ = _unpack_state(states[agent_idx])
-                            last_view_np = v_new.copy()
                 # 方向鍵移動相機（自由模式）
                 elif camera_mode == "free":
                     move_speed = 40
@@ -577,9 +547,7 @@ def watch_ai(ckpt: str, stage_id: int,
                         new_actions.append(act)
 
                     actions = new_actions
-                    # 更新 AI view 為當前跟隨的 agent
-                    view_idx = follow_agent_index % len(states)
-                    v0, _, _ = _unpack_state(states[view_idx])
+                    v0, _, _ = _unpack_state(states[0])
                     last_view_np = v0.copy()
 
                 # env.step — 回傳格式依 n_ai 自動切換
@@ -666,8 +634,8 @@ def main():
     parser.add_argument("--stage", type=int, default=0,
                         choices=list(range(7)),
                         help="觀看的訓練階段 (0–6)")
-    parser.add_argument("--max_frames", type=int, default=None,
-                        help="遊戲最大幀數上限（預設使用階段配置）")
+    parser.add_argument("--max_frames", type=int, default=1200,
+                        help="遊戲最大幀數上限")
     parser.add_argument("--ai_view", action="store_true",
                         help="在右側顯示 AI 觀測層")
     parser.add_argument("--show_comm", action="store_true",
